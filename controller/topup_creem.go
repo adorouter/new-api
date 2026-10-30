@@ -38,7 +38,8 @@ const (
 	// floor is 1.00 (custom_price is sent in cents and their API rejects
 	// anything under 100), which the surcharge keeps us above. The ceiling is
 	// ours; Creem's hard limit is custom_price 99999999 (999,999.99).
-	creemMinTopUp = 1.0
+	// adorouter's floor is 5.00: below that Creem's fixed fee eats the margin.
+	creemMinTopUp = 5.0
 	creemMaxTopUp = 100000.0
 )
 
