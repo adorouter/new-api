@@ -14,6 +14,10 @@ const RouteTagKey = "route_tag"
 func RouteTag(tag string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Set(RouteTagKey, tag)
+		if AdoTextOnlyRelay && tag == "relay" && !adoRelayPathAllowed(c.Request.URL.Path) {
+			abortAdoClosedRelayPath(c)
+			return
+		}
 		c.Next()
 	}
 }
