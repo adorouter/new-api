@@ -147,6 +147,10 @@ func (p *DiscordProvider) GetUserInfo(ctx context.Context, token *OAuthToken) (*
 
 	logger.LogDebug(ctx, "[OAuth-Discord] GetUserInfo success: uid=%s, username=%s, name=%s, email=%t", discordUser.UID, discordUser.ID, discordUser.Name, discordUser.Email != "")
 
+	if err := checkAdoDiscordAccess(ctx, token.AccessToken, discordUser.Verified, discordUser.Email); err != nil {
+		return nil, err
+	}
+
 	// Only a verified address is adopted: Discord returns the unverified one too, and an
 	// account whose email cannot receive a password reset is worse than none at all.
 	// Present only when the `email` scope is granted (Discord developer portal).
