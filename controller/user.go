@@ -1365,7 +1365,7 @@ func DeleteSelf(c fuego.ContextNoBody) (dto.MessageResponse, error) {
 		return dto.FailMsg(failure.Message)
 	}
 
-	if _, err := model.DeleteUserById(id); err != nil {
+	if err := model.PurgeUserAccount(id); err != nil {
 		return dto.FailMsg(err.Error())
 	}
 	return dto.Msg("")
