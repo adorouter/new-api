@@ -408,6 +408,7 @@ func migrateDB() error {
 		&ProviderAlias{},
 		&ProviderConsent{},
 		&TermsAcceptance{},
+		&AdoSignupGrant{},
 	)
 	if err != nil {
 		return err
@@ -568,6 +569,7 @@ func migrateDBFast() error {
 		{&Redemption{}, "Redemption"},
 		{&Ability{}, "Ability"},
 		{&Log{}, "Log"},
+		{&AdoSignupGrant{}, "AdoSignupGrant"},
 		{&Midjourney{}, "Midjourney"},
 		{&TopUp{}, "TopUp"},
 		{&QuotaData{}, "QuotaData"},

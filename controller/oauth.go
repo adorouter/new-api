@@ -826,6 +826,9 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 
 		// Perform post-transaction tasks
 		user.FinalizeOAuthUserCreation(inviterId)
+		if user.DiscordId != "" {
+			service.GrantAdoDiscordSignupCredit(user.Id, user.DiscordId)
+		}
 	}
 	if terms.Valid() {
 		if err := model.RecordTermsAcceptance(user.Id, model.TermsSourceOAuth, terms); err != nil {
