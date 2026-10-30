@@ -38,7 +38,7 @@ func ShouldCopyUpstreamHeader(c *gin.Context, k string, v []string) bool {
 		}
 		return false
 	}
-	return true
+	return adoForwardedResponseHeader(k)
 }
 
 func IOCopyBytesGracefully(c *gin.Context, src *http.Response, data []byte) {

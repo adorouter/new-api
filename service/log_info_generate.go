@@ -78,12 +78,8 @@ func AppendClientAttribution(ctx *gin.Context, other *model.LogOther) {
 	if ua != "" {
 		other.SetPublic("client_user_agent", truncateAttribution(ua))
 	}
-	if network := ClientNetwork(ctx); network != "" {
-		other.SetAdmin("client_net", network)
-	}
-	if fp := ClientFingerprint(ctx); fp != "" {
-		other.SetAdmin("client_fp", fp)
-	}
+	// adorouter keeps no network or client fingerprint in usage logs: upstream
+	// stored the visitor's /24 and a header fingerprint on every request here.
 	// Normalized (lowercased host, default port dropped) so the same platform
 	// groups as one value instead of several spellings.
 	if origin, err := common.NormalizeOrigin(h.Get("Origin")); err == nil {
