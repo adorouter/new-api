@@ -1,0 +1,137 @@
+package controller
+
+import (
+	"net/http"
+	"strconv"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/gin-gonic/gin"
+	"github.com/go-fuego/fuego"
+)
+
+func GetAllQuotaDates(c fuego.ContextWithParams[dto.GetAllQuotaDatesParams]) (*dto.Response[[]*model.QuotaData], error) {
+	p, err := dto.ParseParams[dto.GetAllQuotaDatesParams](c)
+	if err != nil {
+		return dto.Fail[[]*model.QuotaData]("Invalid parameters")
+	}
+	dates, err := model.GetAllQuotaDates(p.StartTimestamp, p.EndTimestamp, p.Username)
+	if err != nil {
+		return dto.Fail[[]*model.QuotaData](err.Error())
+	}
+	return dto.Ok(dates)
+}
+
+// GetQuotaDataSummary returns SQL-aggregated totals over quota_data. Exists so
+// totals-only consumers (the site badge) stop pulling the entire table (1M+
+// rows) just to sum three columns.
+// Same end the storefront sends (2100-01-01), so both share one cached aggregate.
+const publicSummaryEnd = 4102444800
+
+func GetQuotaDataSummary(c fuego.ContextWithParams[dto.GetQuotaSummaryParams]) (*dto.Response[*model.QuotaDataSummary], error) {
+	p, err := dto.ParseParams[dto.GetQuotaSummaryParams](c)
+	if err != nil {
+		return dto.Fail[*model.QuotaDataSummary]("Invalid parameters")
+	}
+	// Anonymous and non-admin callers get the all-time public totals only: a free
+	// window or quota (billed revenue) would let anyone chart usage hour by hour.
+	admin := dto.GinCtx(c).GetInt("role") >= common.RoleAdminUser
+	if !admin {
+		p.StartTimestamp, p.EndTimestamp = 0, publicSummaryEnd
+	}
+	summary, err := model.GetQuotaDataSummary(p.StartTimestamp, p.EndTimestamp)
+	if err != nil {
+		return dto.Fail[*model.QuotaDataSummary](err.Error())
+	}
+	if !admin {
+		return dto.Ok(&model.QuotaDataSummary{Count: summary.Count, TokenUsed: summary.TokenUsed, AvgTpm: summary.AvgTpm})
+	}
+	return dto.Ok(summary)
+}
+
+func GetQuotaDatesByUser(c *gin.Context) {
+	startTimestamp, _ := strconv.ParseInt(c.Query("start_timestamp"), 10, 64)
+	endTimestamp, _ := strconv.ParseInt(c.Query("end_timestamp"), 10, 64)
+	dates, err := model.GetQuotaDataGroupByUser(startTimestamp, endTimestamp)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data":    dates,
+	})
+}
+
+// Sanity bound only (garbage timestamps), not a load guard: the per-user query
+// is bounded by the user's own row count and the admin endpoint is unbounded.
+const maxQuotaDateSpan = 10 * 365 * 86400
+
+// GetFlowQuotaDates serves the admin/root Sankey. The model widens the returned
+// dimensions by role, so the caller's real role is passed through.
+func GetFlowQuotaDates(c fuego.ContextWithParams[dto.GetFlowQuotaDatesParams]) (*dto.Response[[]*model.FlowQuotaData], error) {
+	p, err := dto.ParseParams[dto.GetFlowQuotaDatesParams](c)
+	if err != nil {
+		return dto.Fail[[]*model.FlowQuotaData]("Invalid parameters")
+	}
+	if p.EndTimestamp < p.StartTimestamp {
+		return dto.Fail[[]*model.FlowQuotaData]("End time cannot be earlier than start time")
+	}
+	if p.EndTimestamp-p.StartTimestamp > maxQuotaDateSpan {
+		return dto.Fail[[]*model.FlowQuotaData]("Time span cannot exceed 10 years")
+	}
+	ginCtx := dto.GinCtx(c)
+	dates, err := model.GetFlowQuotaData(p.StartTimestamp, p.EndTimestamp, p.Username, dto.UserID(c), ginCtx.GetInt("role"))
+	if err != nil {
+		return dto.Fail[[]*model.FlowQuotaData](err.Error())
+	}
+	return dto.Ok(dates)
+}
+
+// GetUserFlowQuotaDates serves the self Sankey. Role is forced to common user
+// and username is dropped so an admin's own call cannot widen the scope here.
+func GetUserFlowQuotaDates(c fuego.ContextWithParams[dto.GetFlowQuotaDatesParams]) (*dto.Response[[]*model.FlowQuotaData], error) {
+	p, err := dto.ParseParams[dto.GetFlowQuotaDatesParams](c)
+	if err != nil {
+		return dto.Fail[[]*model.FlowQuotaData]("Invalid parameters")
+	}
+	if p.EndTimestamp < p.StartTimestamp {
+		return dto.Fail[[]*model.FlowQuotaData]("End time cannot be earlier than start time")
+	}
+	if p.EndTimestamp-p.StartTimestamp > maxQuotaDateSpan {
+		return dto.Fail[[]*model.FlowQuotaData]("Time span cannot exceed 10 years")
+	}
+	if _, err := limitLogTimeRange(p.StartTimestamp, p.EndTimestamp); err != nil {
+		return dto.Fail[[]*model.FlowQuotaData](err.Error())
+	}
+	dates, err := model.GetFlowQuotaData(p.StartTimestamp, p.EndTimestamp, "", dto.UserID(c), common.RoleCommonUser)
+	if err != nil {
+		return dto.Fail[[]*model.FlowQuotaData](err.Error())
+	}
+	return dto.Ok(dates)
+}
+
+func GetUserQuotaDates(c fuego.ContextWithParams[dto.GetUserQuotaDatesParams]) (*dto.Response[[]*model.QuotaData], error) {
+	userId := dto.UserID(c)
+	p, err := dto.ParseParams[dto.GetUserQuotaDatesParams](c)
+	if err != nil {
+		return dto.Fail[[]*model.QuotaData]("Invalid parameters")
+	}
+	if p.EndTimestamp < p.StartTimestamp {
+		return dto.Fail[[]*model.QuotaData]("End time cannot be earlier than start time")
+	}
+	if p.EndTimestamp-p.StartTimestamp > maxQuotaDateSpan {
+		return dto.Fail[[]*model.QuotaData]("Time span cannot exceed 10 years")
+	}
+	startTimestamp, err := limitLogTimeRange(p.StartTimestamp, p.EndTimestamp)
+	if err != nil {
+		return dto.Fail[[]*model.QuotaData](err.Error())
+	}
+	dates, err := model.GetQuotaDataByUserId(userId, startTimestamp, p.EndTimestamp)
+	if err != nil {
+		return dto.Fail[[]*model.QuotaData](err.Error())
+	}
+	return dto.Ok(dates)
+}

@@ -1,0 +1,333 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
+
+	"github.com/bytedance/gopkg/util/gopool"
+)
+
+var freeAbuseLimiter common.InMemoryRateLimiter
+var freeAbuseDayLimiter common.InMemoryRateLimiter
+var freeAbuseErrLimiter common.InMemoryRateLimiter
+
+// freeModelSets tracks, per user, the distinct free models seen within the current
+// window on this instance (single-instance fallback when Redis is off).
+var freeModelSets = struct {
+	sync.Mutex
+	m map[int]map[string]int64
+}{m: make(map[int]map[string]int64)}
+
+// freeMediaErrModelSets mirrors freeModelSets but for distinct FAILING free media
+// models per user per window (single-instance fallback when Redis is off).
+var freeMediaErrModelSets = struct {
+	sync.Mutex
+	m map[int]map[string]int64
+}{m: make(map[int]map[string]int64)}
+
+const freeAbuseWindowSeconds = 60
+const freeAbuseDaySeconds = 86400
+const freeAbuseErrWindowSeconds = 3600
+
+// Outlives the UTC date its key is named for, so a set still being written just
+// before midnight is not dropped mid-day. Only garbage collection: the day itself
+// comes from the key name (see recordDistinctFreeModelDay).
+const freeAbuseDayModelTTL = 26 * time.Hour
+
+// TrackFreeModelUsage records a single free-model request for a user and auto-sets
+// BlockFreeWhenNoQuota when the user's balance is non-positive AND any signal
+// trips: the per-minute request count exceeds FreeAbuseMaxPerMinute, the number of
+// DISTINCT free models hit in the minute exceeds FreeAbuseMaxDistinctModels (fast
+// model-switching = scraping), the daily request count exceeds FreeAbuseMaxPerDay,
+// or the distinct free models seen TODAY exceed FreeAbuseMaxDistinctModelsPerDay
+// (the same scraping shape, paced slowly enough to stay under the minute windows).
+// No-op when the global auto-block setting is disabled. The flag clears
+// automatically on the next quota top-up (see model.IncreaseUserQuota).
+func TrackFreeModelUsage(userId int, userQuota int, modelName string, verified bool) {
+	setting := operation_setting.GetQuotaSetting()
+	if !setting.EnableFreeAbuseAutoBlock {
+		return
+	}
+	scale := freeAbuseScale(setting, verified)
+	maxPerMin := scale(setting.FreeAbuseMaxPerMinute)
+
+	over := maxPerMin > 0 && recordFreeUsage(userId, maxPerMin)
+
+	maxDistinct := scale(setting.FreeAbuseMaxDistinctModels)
+	tooManyModels := maxDistinct > 0 && modelName != "" &&
+		recordDistinctFreeModel(userId, modelName) > maxDistinct
+
+	// Slow-but-relentless scraper: paces under the per-minute limits but racks up
+	// thousands of free requests per DAY. Per-minute windows never catch it; the
+	// daily counter does.
+	maxPerDay := scale(setting.FreeAbuseMaxPerDay)
+	overDaily := maxPerDay > 0 &&
+		recordWindowedUsage("freeAbuseDay", &freeAbuseDayLimiter, userId, maxPerDay, freeAbuseDaySeconds)
+
+	// Catalog sweep paced under every per-minute limit. Unlike the signals above
+	// this one checks the balance BEFORE recording: its keys live for a day, and a
+	// day of keys for a user who can never be blocked is pure waste.
+	maxDistinctDay := scale(setting.FreeAbuseMaxDistinctModelsPerDay)
+	tooManyModelsDaily := maxDistinctDay > 0 && modelName != "" && userQuota <= 0 &&
+		recordDistinctFreeModelDay(userId, modelName) > maxDistinctDay
+
+	if (!over && !tooManyModels && !overDaily && !tooManyModelsDaily) || userQuota > 0 {
+		return
+	}
+
+	gopool.Go(func() {
+		autoBlockUser(userId)
+	})
+}
+
+// TrackFreeModelError records a FAILED free-model request. A user hammering a
+// disabled or nonexistent model retries relentlessly (a human gives up), so a
+// high hourly error count at non-positive balance is a strong bot signal. Blocks
+// when FreeAbuseMaxErrorsPerHour is exceeded. The caller must exclude transient
+// upstream infra faults (5xx/429/timeout) before calling: those are our capacity
+// failing, not abuse, and would otherwise auto-block heavy legit users during an
+// upstream outage.
+//
+// isMedia marks image/audio/video requests. Catalog-probe scrapers scan many
+// distinct free MEDIA models that mostly 404/400 (no legit user fires 3+ failing
+// image gens back-to-back), so a separate, much smaller distinct-failing-media
+// threshold catches the probe shape regardless of volume - it trips well under
+// the per-minute/per-day/hourly-error counts a paced scraper stays beneath.
+// Text models are exempt (users legitimately try several chat models). No-op when
+// disabled or quota > 0.
+func TrackFreeModelError(userId int, userQuota int, modelName string, isMedia bool, verified bool) {
+	// A verified account's failures are usually ours or its chat outgrowing the
+	// context (a 400 its client retries on every message), and since the block
+	// binds verified accounts this signal cut off ordinary users. The volume and
+	// sweep signals in TrackFreeModelUsage still apply to them.
+	if userId <= 0 || userQuota > 0 || verified {
+		return
+	}
+	setting := operation_setting.GetQuotaSetting()
+	if !setting.EnableFreeAbuseAutoBlock {
+		return
+	}
+	scale := freeAbuseScale(setting, verified)
+
+	block := false
+
+	maxErr := scale(setting.FreeAbuseMaxErrorsPerHour)
+	if maxErr > 0 && recordWindowedUsage("freeAbuseErr", &freeAbuseErrLimiter, userId, maxErr, freeAbuseErrWindowSeconds) {
+		block = true
+	}
+
+	maxMediaErr := scale(setting.FreeAbuseMaxMediaErrModels)
+	if isMedia && maxMediaErr > 0 && modelName != "" &&
+		recordDistinctMediaErrModel(userId, modelName) > maxMediaErr {
+		block = true
+	}
+
+	if !block {
+		return
+	}
+	gopool.Go(func() {
+		autoBlockUser(userId)
+	})
+}
+
+// FreeUserVerified reports whether anything beyond a password stands behind the
+// account: a third-party login, money that was ever spent (a top-up or a granted
+// reward, since free models consume nothing), or an email at a mainstream
+// provider while email verification is on (farms verify throwaway inboxes on
+// their own domains just as easily). Every account farm
+// seen so far had none of these, while 61% of ordinary signups bind a login, so
+// the unverified thresholds below can sit well under the ordinary ones without
+// touching most real users.
+func FreeUserVerified(hasIdentity bool, usedQuota int, email string) bool {
+	return hasIdentity || usedQuota > 0 || (common.EmailVerificationEnabled && common.MainstreamEmailDomain(email))
+}
+
+// freeAbuseScale returns the threshold scaler for this account: identity at 100%,
+// an unverified zero-balance account at FreeAbuseUnverifiedPct. A threshold of 0
+// stays 0 (disabled), and a scaled one never drops below 1.
+func freeAbuseScale(setting *operation_setting.QuotaSetting, verified bool) func(int) int {
+	pct := setting.FreeAbuseUnverifiedPct
+	if verified || pct <= 0 || pct >= 100 {
+		return func(v int) int { return v }
+	}
+	return func(v int) int {
+		if v <= 0 {
+			return v
+		}
+		return max(v*pct/100, 1)
+	}
+}
+
+// recordWindowedUsage increments a per-user counter under keyPrefix for the given
+// window and reports whether it now exceeds max. Redis-backed (cross-instance)
+// with an in-memory sliding-window fallback, mirroring recordFreeUsage.
+func recordWindowedUsage(keyPrefix string, mem *common.InMemoryRateLimiter, userId int, max int, windowSeconds int) bool {
+	if common.RedisEnabled {
+		ctx := context.Background()
+		key := fmt.Sprintf("%s:user:%d", keyPrefix, userId)
+		count, err := common.RDB.Incr(ctx, key).Result()
+		if err != nil {
+			common.SysLog(keyPrefix + " counter incr failed: " + err.Error())
+			return false
+		}
+		if count == 1 {
+			common.RDB.Expire(ctx, key, time.Duration(windowSeconds)*time.Second)
+		}
+		return count > int64(max)
+	}
+	key := fmt.Sprintf("%s:user:%d", keyPrefix, userId)
+	mem.Init(time.Duration(windowSeconds) * time.Second)
+	allowed := mem.Request(key, max, int64(windowSeconds))
+	return !allowed
+}
+
+// recordDistinctFreeModel adds modelName to the user's per-window model set and
+// returns the current distinct-model count. Uses a Redis SET when enabled
+// (cross-instance), otherwise an in-memory per-model sliding window whose
+// saturation count approximates the distinct set on a single instance.
+func recordDistinctFreeModel(userId int, modelName string) int {
+	return recordDistinctModelSet("freeAbuseModels", &freeModelSets, userId, modelName)
+}
+
+// recordDistinctMediaErrModel tracks distinct FAILING free media models per user
+// per window under its own key, so it never mixes with the all-request distinct
+// set above.
+func recordDistinctMediaErrModel(userId int, modelName string) int {
+	return recordDistinctModelSet("freeAbuseMediaErrModels", &freeMediaErrModelSets, userId, modelName)
+}
+
+// recordDistinctFreeModelDay counts the distinct free models a user has touched
+// today. The per-minute set above cannot see a scraper that spreads its catalog
+// sweep over hours: a farm measured on 2026-09-10 averaged 25 to 39 distinct free
+// models a day while never exceeding 8 within any minute.
+//
+// The window lives in the KEY, not in the expiry. Reusing the sliding window would
+// mean re-arming EXPIRE on every newly discovered model, which is harmless over 60
+// seconds but over a day lets a slow discoverer hold one key open indefinitely. A
+// date-stamped key is a real day no matter what the TTL does, so the TTL is only
+// garbage collection and a plain Expire stays portable to pre-7.0 Redis.
+//
+// Redis-only on purpose: the in-memory fallback used by recordDistinctModelSet
+// never evicts idle users from its outer map and rescans a user's whole model map
+// under one global mutex per request. Both are fine for a minute of names and
+// become a leak and a lock convoy for a day of them. Without Redis this signal is
+// inert rather than dangerous.
+func recordDistinctFreeModelDay(userId int, modelName string) int {
+	if !common.RedisEnabled {
+		return 0
+	}
+	ctx := context.Background()
+	key := fmt.Sprintf("freeAbuseModelsDay:user:%d:%s", userId, time.Now().UTC().Format("20060102"))
+	added, err := common.RDB.SAdd(ctx, key, modelName).Result()
+	if err != nil {
+		common.SysLog("free abuse daily model-set add failed: " + err.Error())
+		return 0
+	}
+	if added > 0 {
+		common.RDB.Expire(ctx, key, freeAbuseDayModelTTL)
+	}
+	total, err := common.RDB.SCard(ctx, key).Result()
+	if err != nil {
+		return 0
+	}
+	return int(total)
+}
+
+// recordDistinctModelSet adds modelName to the user's per-window set under
+// keyPrefix and returns the current distinct count. Uses a Redis SET when enabled
+// (cross-instance), otherwise the given in-memory per-model sliding window whose
+// live entry count approximates the distinct set on a single instance.
+func recordDistinctModelSet(keyPrefix string, sets *struct {
+	sync.Mutex
+	m map[int]map[string]int64
+}, userId int, modelName string) int {
+	if common.RedisEnabled {
+		ctx := context.Background()
+		key := fmt.Sprintf("%s:user:%d", keyPrefix, userId)
+		count, err := common.RDB.SAdd(ctx, key, modelName).Result()
+		if err != nil {
+			common.SysLog(keyPrefix + " model-set add failed: " + err.Error())
+			return 0
+		}
+		if count > 0 {
+			// (re)arm the window expiry on first membership change
+			common.RDB.Expire(ctx, key, freeAbuseWindowSeconds*time.Second)
+		}
+		total, err := common.RDB.SCard(ctx, key).Result()
+		if err != nil {
+			return 0
+		}
+		return int(total)
+	}
+
+	// In-memory fallback: per-user map of model -> last-seen unix ts. Prune entries
+	// older than the window, add this model, return the live distinct count.
+	now := time.Now().Unix()
+	sets.Lock()
+	defer sets.Unlock()
+	models := sets.m[userId]
+	if models == nil {
+		models = make(map[string]int64)
+		sets.m[userId] = models
+	}
+	for name, ts := range models {
+		if now-ts >= freeAbuseWindowSeconds {
+			delete(models, name)
+		}
+	}
+	models[modelName] = now
+	return len(models)
+}
+
+// recordFreeUsage increments the per-user request counter for the current window
+// and reports whether the count has exceeded maxPerMin. Uses Redis when enabled
+// (cross-instance), otherwise an in-memory sliding window (single instance).
+func recordFreeUsage(userId int, maxPerMin int) bool {
+	if common.RedisEnabled {
+		ctx := context.Background()
+		key := fmt.Sprintf("freeAbuse:user:%d", userId)
+		count, err := common.RDB.Incr(ctx, key).Result()
+		if err != nil {
+			common.SysLog("free abuse counter incr failed: " + err.Error())
+			return false
+		}
+		if count == 1 {
+			common.RDB.Expire(ctx, key, freeAbuseWindowSeconds*time.Second)
+		}
+		return count > int64(maxPerMin)
+	}
+
+	// In-memory fallback: Request returns false once the window is saturated.
+	key := fmt.Sprintf("freeAbuse:user:%d", userId)
+	freeAbuseLimiter.Init(freeAbuseWindowSeconds * time.Second)
+	allowed := freeAbuseLimiter.Request(key, maxPerMin, freeAbuseWindowSeconds)
+	return !allowed
+}
+
+func autoBlockUser(userId int) {
+	s, err := model.GetUserSetting(userId, false)
+	if err == nil && s.BlockFreeWhenNoQuota {
+		return // already blocked
+	}
+	user, err := model.GetUserById(userId, true)
+	if err != nil {
+		return
+	}
+	ns := user.GetSetting()
+	if ns.BlockFreeWhenNoQuota {
+		return
+	}
+	ns.BlockFreeWhenNoQuota = true
+	user.SetSetting(ns)
+	if err := user.Update(false); err != nil {
+		common.SysLog(fmt.Sprintf("failed to auto-block user %d for free-model abuse: %s", userId, err.Error()))
+		return
+	}
+	model.RecordLog(userId, model.LogTypeManage, common.NewMessage("auto-blocked free models for user due to free-model abuse with zero balance"))
+}

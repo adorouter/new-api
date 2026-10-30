@@ -1,0 +1,812 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/i18n"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/go-redis/redis/v8"
+)
+
+func formatNotifyType(channelId int, status int) string {
+	return fmt.Sprintf("%s_%d_%d", dto.NotifyTypeChannelUpdate, channelId, status)
+}
+
+// Disabling on the FIRST empty upstream response false-bans healthy channels on
+// transient reseller hiccups, but never disabling lets a dead-but-enabled channel
+// spam errors forever (the autotest cron only probes DISABLED channels, so live
+// disable is the only removal path). Decision is rate-based: a channel is disabled
+// once its empty responses are a large enough SHARE of its traffic in the window,
+// so a high-volume healthy channel is not false-banned by scattered empties while
+// one heavy user cannot cascade the whole pool. A fully dead channel (no successes)
+// still trips the absolute floor. Both counters live in Redis so they aggregate
+// across swarm replicas; an in-process map is the single-instance fallback.
+const emptyResponseCounterTTL = 10 * time.Minute
+
+var emptyResponseFailCounts sync.Map  // channelId -> emptyResponseWindow, fallback when Redis is unavailable
+var channelSuccessCounts sync.Map     // channelId -> emptyResponseWindow, fallback when Redis is unavailable
+var channelFailureCounts sync.Map     // channelId -> emptyResponseWindow, fallback when Redis is unavailable
+var channelFailureStreaks sync.Map    // channelId -> int, fallback when Redis is unavailable
+var channelTruncationCounts sync.Map  // channelId -> emptyResponseWindow, fallback when Redis is unavailable
+var channelLongRequestCounts sync.Map // channelId -> emptyResponseWindow, fallback when Redis is unavailable
+
+type emptyResponseWindow struct {
+	count int
+	start time.Time
+}
+
+func emptyResponseCounterKey(channelId int) string {
+	return fmt.Sprintf("empty_response_fail:%d", channelId)
+}
+
+func channelSuccessCounterKey(channelId int) string {
+	return fmt.Sprintf("channel_success:%d", channelId)
+}
+
+func channelFailureCounterKey(channelId int) string {
+	return fmt.Sprintf("channel_fail:%d", channelId)
+}
+
+func channelTruncationCounterKey(channelId int) string {
+	return fmt.Sprintf("channel_truncation:%d", channelId)
+}
+
+func channelLongRequestCounterKey(channelId int) string {
+	return fmt.Sprintf("channel_long_request:%d", channelId)
+}
+
+func channelFailureStreakKey(channelId int) string {
+	return fmt.Sprintf("channel_fail_streak:%d", channelId)
+}
+
+func channelProbationKey(channelId int) string {
+	return fmt.Sprintf("channel_probation:%d", channelId)
+}
+
+func channelProbePassKey(channelId int) string {
+	return fmt.Sprintf("channel_probe_pass:%d", channelId)
+}
+
+func channelProbeFailKey(channelId int) string {
+	return fmt.Sprintf("channel_probe_fail:%d", channelId)
+}
+
+var channelProbationUntil sync.Map // channelId -> time.Time, fallback when Redis is unavailable
+var channelProbePasses sync.Map    // channelId -> emptyResponseWindow, fallback when Redis is unavailable
+var channelProbeFails sync.Map     // channelId -> int, fallback when Redis is unavailable
+
+// A probe streak outlives the gaps the backoff itself introduces, so its TTL has
+// to exceed the longest wait by a wide margin; a week also forgets a channel that
+// has been deleted or left alone.
+const channelProbeFailTTL = 7 * 24 * time.Hour
+
+// RecordProbeFailure counts one more consecutive scheduled-probe failure for a
+// channel and returns the streak. Unlike the fixed-window counters the TTL is
+// refreshed on every failure: the streak measures a run of failures, and the
+// backoff it feeds can put hours between two probes.
+func RecordProbeFailure(channelId int) int {
+	if common.RedisEnabled {
+		ctx := context.Background()
+		n, err := common.RDB.Incr(ctx, channelProbeFailKey(channelId)).Result()
+		if err == nil {
+			common.RDB.Expire(ctx, channelProbeFailKey(channelId), channelProbeFailTTL)
+			return int(n)
+		}
+		common.SysError("probe failure streak Redis incr failed: " + err.Error())
+	}
+	streak := 1
+	if v, ok := channelProbeFails.Load(channelId); ok {
+		streak = v.(int) + 1
+	}
+	channelProbeFails.Store(channelId, streak)
+	return streak
+}
+
+// ResetProbeFailures clears the streak after a probe passes, so a channel that
+// comes back is asked at the normal cadence again.
+func ResetProbeFailures(channelId int) {
+	if common.RedisEnabled {
+		common.RDB.Del(context.Background(), channelProbeFailKey(channelId))
+	}
+	channelProbeFails.Delete(channelId)
+}
+
+func probeFailureStreak(channelId int) int {
+	if common.RedisEnabled {
+		v, err := common.RDB.Get(context.Background(), channelProbeFailKey(channelId)).Int()
+		if err == nil {
+			return v
+		}
+		if errors.Is(err, redis.Nil) {
+			return 0
+		}
+	}
+	if v, ok := channelProbeFails.Load(channelId); ok {
+		return v.(int)
+	}
+	return 0
+}
+
+// ProbeBackoffSeconds is how long a channel should be left alone before its next
+// scheduled probe, from its failure streak. Below the floor a channel is probed at
+// the normal cadence, so a transient fault still recovers in minutes.
+func ProbeBackoffSeconds(channelId int) int64 {
+	m := operation_setting.GetMonitorSetting()
+	if m.ChannelProbeBackoffBaseSeconds <= 0 || m.ChannelProbeBackoffMaxSeconds <= 0 {
+		return 0
+	}
+	floor := m.ChannelProbeBackoffFloor
+	if floor <= 0 {
+		floor = 3
+	}
+	shift := probeFailureStreak(channelId) - floor
+	if shift < 0 {
+		return 0
+	}
+	if shift >= 20 {
+		return int64(m.ChannelProbeBackoffMaxSeconds)
+	}
+	return min(int64(m.ChannelProbeBackoffBaseSeconds)<<uint(shift), int64(m.ChannelProbeBackoffMaxSeconds))
+}
+
+// StartChannelProbation arms the probation window for a channel that was just
+// re-enabled automatically and clears its failure window, so the tighter probation
+// thresholds judge only what the lane does from now on.
+func StartChannelProbation(channelId int) {
+	seconds := operation_setting.GetMonitorSetting().ChannelProbationSeconds
+	resetChannelWindow(channelId)
+	if seconds <= 0 {
+		return
+	}
+	ttl := time.Duration(seconds) * time.Second
+	if common.RedisEnabled {
+		if err := common.RDB.Set(context.Background(), channelProbationKey(channelId), "1", ttl).Err(); err == nil {
+			return
+		}
+	}
+	channelProbationUntil.Store(channelId, time.Now().Add(ttl))
+}
+
+// InChannelProbation reports whether an automatic re-enable is still on probation.
+func InChannelProbation(channelId int) bool {
+	return inChannelProbation(channelId)
+}
+
+func inChannelProbation(channelId int) bool {
+	if common.RedisEnabled {
+		n, err := common.RDB.Exists(context.Background(), channelProbationKey(channelId)).Result()
+		if err == nil {
+			return n > 0
+		}
+	}
+	if v, ok := channelProbationUntil.Load(channelId); ok {
+		return time.Now().Before(v.(time.Time))
+	}
+	return false
+}
+
+func resetChannelWindow(channelId int) {
+	if common.RedisEnabled {
+		common.RDB.Del(context.Background(), channelFailureCounterKey(channelId), channelSuccessCounterKey(channelId))
+	}
+	channelFailureCounts.Delete(channelId)
+	channelSuccessCounts.Delete(channelId)
+	resetFailureStreak(channelId)
+	resetSlowWindow(channelId)
+}
+
+// Slow window: one counter per channel per hour, read as the sum of the last
+// ChannelSlowWindowHours buckets, so the window slides instead of resetting at
+// a cliff. Keys live in Redis for the swarm with the same in-process fallback.
+const slowSlotSeconds = 3600
+
+var channelSlowFailSlots sync.Map // channelId -> map[int64]int, fallback when Redis is unavailable
+var channelSlowOkSlots sync.Map   // channelId -> map[int64]int, fallback when Redis is unavailable
+
+func slowSlotKey(kind string, channelId int, slot int64) string {
+	return fmt.Sprintf("channel_slow_%s:%d:%d", kind, channelId, slot)
+}
+
+func slowWindowHours() int {
+	h := operation_setting.GetMonitorSetting().ChannelSlowWindowHours
+	if h < 0 {
+		return 0
+	}
+	return h
+}
+
+func bumpSlowSlot(kind string, fallback *sync.Map, channelId int) {
+	hours := slowWindowHours()
+	if hours == 0 {
+		return
+	}
+	slot := time.Now().Unix() / slowSlotSeconds
+	if common.RedisEnabled {
+		ctx := context.Background()
+		key := slowSlotKey(kind, channelId, slot)
+		if n, err := common.RDB.Incr(ctx, key).Result(); err == nil {
+			if n == 1 {
+				common.RDB.Expire(ctx, key, time.Duration(hours+1)*time.Hour)
+			}
+			return
+		} else {
+			common.SysError("slow window Redis incr failed: " + err.Error())
+		}
+	}
+	v, _ := fallback.LoadOrStore(channelId, map[int64]int{})
+	slots := v.(map[int64]int)
+	slots[slot]++
+	for s := range slots {
+		if s < slot-int64(hours) {
+			delete(slots, s)
+		}
+	}
+}
+
+func readSlowSlots(kind string, fallback *sync.Map, channelId int) int {
+	hours := slowWindowHours()
+	if hours == 0 {
+		return 0
+	}
+	now := time.Now().Unix() / slowSlotSeconds
+	if common.RedisEnabled {
+		keys := make([]string, 0, hours)
+		for i := 0; i < hours; i++ {
+			keys = append(keys, slowSlotKey(kind, channelId, now-int64(i)))
+		}
+		vals, err := common.RDB.MGet(context.Background(), keys...).Result()
+		if err == nil {
+			total := 0
+			for _, v := range vals {
+				if s, ok := v.(string); ok {
+					n, _ := strconv.Atoi(s)
+					total += n
+				}
+			}
+			return total
+		}
+		common.SysError("slow window Redis mget failed: " + err.Error())
+	}
+	v, ok := fallback.Load(channelId)
+	if !ok {
+		return 0
+	}
+	total := 0
+	for s, n := range v.(map[int64]int) {
+		if s > now-int64(hours) {
+			total += n
+		}
+	}
+	return total
+}
+
+func resetSlowWindow(channelId int) {
+	hours := slowWindowHours()
+	if common.RedisEnabled && hours > 0 {
+		now := time.Now().Unix() / slowSlotSeconds
+		keys := make([]string, 0, 2*(hours+1))
+		for i := 0; i <= hours; i++ {
+			keys = append(keys, slowSlotKey("fail", channelId, now-int64(i)), slowSlotKey("ok", channelId, now-int64(i)))
+		}
+		common.RDB.Del(context.Background(), keys...)
+	}
+	channelSlowFailSlots.Delete(channelId)
+	channelSlowOkSlots.Delete(channelId)
+}
+
+// SlowWindowExceeded is the second gate behind the ten minute one: the failure
+// share over the slow window, floored so a quiet lane needs a sustained fault
+// and not a bad afternoon. It reports the counts it judged for the log line.
+func SlowWindowExceeded(channelId int) (failures int, successes int, exceeded bool) {
+	m := operation_setting.GetMonitorSetting()
+	hours := slowWindowHours()
+	if hours == 0 {
+		return 0, 0, false
+	}
+	failures = readSlowSlots("fail", &channelSlowFailSlots, channelId)
+	successes = readSlowSlots("ok", &channelSlowOkSlots, channelId)
+	floor := m.ChannelSlowFailureAbsoluteFloor
+	if floor <= 0 {
+		floor = 20
+	}
+	if failures < floor {
+		return failures, successes, false
+	}
+	threshold := m.ChannelSlowFailureRateThreshold
+	if threshold <= 0 {
+		threshold = m.ChannelFailureRateThreshold
+	}
+	if threshold <= 0 {
+		return failures, successes, false
+	}
+	return failures, successes, float64(failures)/float64(failures+successes) >= threshold
+}
+
+// SoleLaneDead reports whether the last lane serving a model has stopped
+// serving in any useful sense over the slow window: at least soleLaneDeadFloor
+// failures and no more than one success in ten. Such a lane is kept enabled by
+// the last upstream rule only to hang every request on a deadline and then fail
+// it; disabled, the same requests fail at once and the disabled channel retest
+// brings the lane back the moment it answers again.
+const soleLaneDeadFloor = 100
+const soleLaneDeadRate = 0.9
+
+// Nothing through the fast window is dead too, whatever the slow one still
+// holds: dsg1 glm-5.3 served 0 of 2,500 for four hours on 2026-09-23 while its
+// afternoon successes kept the 6h rate under soleLaneDeadRate.
+const soleLaneFastDeadFloor = 30
+
+func SoleLaneDead(channelId int) (failures int, successes int, dead bool) {
+	if f, ok := ChannelFailureWindow(channelId); ok == 0 && f >= soleLaneFastDeadFloor {
+		return f, ok, true
+	}
+	if slowWindowHours() == 0 {
+		return 0, 0, false
+	}
+	failures = readSlowSlots("fail", &channelSlowFailSlots, channelId)
+	successes = readSlowSlots("ok", &channelSlowOkSlots, channelId)
+	if failures < soleLaneDeadFloor {
+		return failures, successes, false
+	}
+	return failures, successes, float64(failures)/float64(failures+successes) >= soleLaneDeadRate
+}
+
+// RecordRecoveryProbePass counts consecutive clean recovery probes on a disabled
+// channel and reports whether enough have passed to re-enable it.
+func RecordRecoveryProbePass(channelId int) bool {
+	need := operation_setting.GetMonitorSetting().ChannelReenableProbePasses
+	if need <= 1 {
+		return true
+	}
+	passes := bumpWindowCounter(channelProbePassKey(channelId), &channelProbePasses, channelId)
+	return passes >= need
+}
+
+func ResetRecoveryProbePasses(channelId int) {
+	if common.RedisEnabled {
+		common.RDB.Del(context.Background(), channelProbePassKey(channelId))
+	}
+	channelProbePasses.Delete(channelId)
+}
+
+// bumpWindowCounter increments a fixed-window Redis counter, arming the TTL on the
+// first hit so the count self-expires, and returns the new value. Falls back to an
+// in-process fixed window when Redis is unavailable.
+func bumpWindowCounter(key string, fallback *sync.Map, id any) int {
+	if common.RedisEnabled {
+		ctx := context.Background()
+		n, err := common.RDB.Incr(ctx, key).Result()
+		if err == nil {
+			if n == 1 {
+				common.RDB.Expire(ctx, key, emptyResponseCounterTTL)
+			}
+			return int(n)
+		}
+		common.SysError("window counter Redis incr failed: " + err.Error())
+	}
+	now := time.Now()
+	next := emptyResponseWindow{count: 1, start: now}
+	if v, ok := fallback.Load(id); ok {
+		prev := v.(emptyResponseWindow)
+		if now.Sub(prev.start) < emptyResponseCounterTTL {
+			next = emptyResponseWindow{count: prev.count + 1, start: prev.start}
+		}
+	}
+	fallback.Store(id, next)
+	return next.count
+}
+
+// readWindowCounter returns the current value of a fixed-window counter without
+// mutating it (Redis GET, or the live in-process window).
+func readWindowCounter(key string, fallback *sync.Map, id any) int {
+	if common.RedisEnabled {
+		ctx := context.Background()
+		n, err := common.RDB.Get(ctx, key).Int()
+		if err == nil {
+			return n
+		}
+		return 0 // redis.Nil (no key) or parse error -> treat as empty window
+	}
+	if v, ok := fallback.Load(id); ok {
+		w := v.(emptyResponseWindow)
+		if time.Since(w.start) < emptyResponseCounterTTL {
+			return w.count
+		}
+	}
+	return 0
+}
+
+// RecordChannelSuccess bumps the per-channel success counter in the same window as
+// the empty-response counter, feeding the rate-based disable decision.
+// bumpFailureStreak increments the consecutive-failure counter and returns the new
+// value. Unlike the window counters this has no fixed window: it is cleared by the
+// next success, so its value is the length of the current unbroken failure run. The
+// TTL only stops an abandoned streak from living forever.
+func bumpFailureStreak(channelId int) int {
+	if common.RedisEnabled {
+		ctx := context.Background()
+		n, err := common.RDB.Incr(ctx, channelFailureStreakKey(channelId)).Result()
+		if err == nil {
+			if n == 1 {
+				common.RDB.Expire(ctx, channelFailureStreakKey(channelId), emptyResponseCounterTTL)
+			}
+			return int(n)
+		}
+		common.SysError("failure streak Redis incr failed: " + err.Error())
+	}
+	next := 1
+	if v, ok := channelFailureStreaks.Load(channelId); ok {
+		if prev, ok := v.(int); ok {
+			next = prev + 1
+		}
+	}
+	channelFailureStreaks.Store(channelId, next)
+	return next
+}
+
+func resetFailureStreak(channelId int) {
+	if common.RedisEnabled {
+		common.RDB.Del(context.Background(), channelFailureStreakKey(channelId))
+	}
+	channelFailureStreaks.Delete(channelId)
+}
+
+func RecordChannelSuccess(channelId int) {
+	bumpWindowCounter(channelSuccessCounterKey(channelId), &channelSuccessCounts, channelId)
+	bumpSlowSlot("ok", &channelSlowOkSlots, channelId)
+	ClearLaneCooldown(channelId)
+	// Any success breaks the run, so the streak must not survive it.
+	resetFailureStreak(channelId)
+}
+
+// RecordEmptyResponseFailure bumps the empty-response counter for a channel and
+// reports whether it has reached the disable decision. Rate-based: disable when
+// empties are >= EmptyResponseRateThreshold of total traffic over at least
+// EmptyResponseMinSamples requests, OR empties alone reach EmptyResponseAbsoluteFloor
+// (a fully dead channel with no successes). Fixed window: TTL is armed on the first
+// empty, so counts self-expire and no success-path reset is needed.
+func RecordEmptyResponseFailure(channelId int) bool {
+	empties := bumpWindowCounter(emptyResponseCounterKey(channelId), &emptyResponseFailCounts, channelId)
+	successes := readWindowCounter(channelSuccessCounterKey(channelId), &channelSuccessCounts, channelId)
+
+	m := operation_setting.GetMonitorSetting()
+	floor := m.EmptyResponseAbsoluteFloor
+	if floor <= 0 {
+		floor = 5
+	}
+	// The floor is the DEAD-channel signal, so it only applies while the channel has
+	// answered nothing. Applied unconditionally it pulls a busy channel for its
+	// ordinary share of empties: a slow upstream returns a few every window no
+	// matter how much it is serving, and at a floor of 3-5 that is minutes of
+	// traffic, not a fault. Once there are successes the rate below decides.
+	if empties >= floor && successes == 0 {
+		return true
+	}
+	if m.EmptyResponseMinSamples <= 0 || m.EmptyResponseRateThreshold <= 0 {
+		return false // rate disabled/unconfigured: floor is the only trigger
+	}
+	total := empties + successes
+	if total < m.EmptyResponseMinSamples {
+		return false
+	}
+	return float64(empties)/float64(total) >= m.EmptyResponseRateThreshold
+}
+
+// transientCapacityCodes are channel:* faults that report a saturated or stalled
+// upstream, not a dead credential. They carry a 429 so the reason survives
+// Cloudflare and the chat frontends that discard 5xx bodies, which would
+// otherwise read as a spent quota here and disable the channel on first sight.
+// They stay rate-gated: a shard that stalls one request while serving the rest
+// must not be pulled.
+var transientCapacityCodes = map[types.ErrorCode]struct{}{
+	types.ErrorCodeChannelResponseTimeExceeded: {},
+	types.ErrorCodeChannelEmptyResponse:        {},
+	"channel:stream_timeout_no_response":       {},
+}
+
+func IsTransientCapacityCode(err *types.NewAPIError) bool {
+	if err == nil {
+		return false
+	}
+	_, exists := transientCapacityCodes[err.GetErrorCode()]
+	return exists
+}
+
+// IsCredentialFault reports whether an error means the channel's credential is
+// dead rather than the upstream having a bad moment. These bypass the failure-rate
+// window and disable on first sight: waiting out a window on a revoked key only
+// serves users errors for requests that cannot succeed.
+func IsCredentialFault(err *types.NewAPIError) bool {
+	if err == nil {
+		return false
+	}
+	if err.StatusCode == http.StatusUnauthorized {
+		return true
+	}
+	// A 429 is normally capacity and must stay rate-gated, but a drained wallet or
+	// spent free quota is reclassified to a channel:* code upstream of here and
+	// cannot clear on its own, so it parks immediately like any dead credential.
+	if IsTransientCapacityCode(err) {
+		return false
+	}
+	return (err.StatusCode == http.StatusForbidden || err.StatusCode == http.StatusTooManyRequests) &&
+		types.IsChannelError(err)
+}
+
+// RecordChannelFailure bumps the per-channel failure counter and reports whether the
+// channel has failed enough of its recent traffic to be disabled. Rate first: a
+// channel is only pulled when failures are a large SHARE of its window, so the
+// busiest lanes are not banned for the scattered 429s that come with carrying the
+// most traffic. The absolute floor applies only once a channel has piled up failures
+// with no successes to show for them, which is what a genuinely dead lane looks like.
+// A soft failure is one the upstream's own text marks as a capacity limit rather
+// than a fault: it still counts toward the rate gate, but skips every gate that
+// fires on a short run (streak, probation streak, dead floor). Those read a few
+// concurrent 429s as a dead lane and produced ~19k disables a week; the rate gate
+// needs a sustained share of the window and does not.
+func RecordChannelFailure(channelId int, soft bool) bool {
+	failures := bumpWindowCounter(channelFailureCounterKey(channelId), &channelFailureCounts, channelId)
+	bumpSlowSlot("fail", &channelSlowFailSlots, channelId)
+	successes := readWindowCounter(channelSuccessCounterKey(channelId), &channelSuccessCounts, channelId)
+
+	m := operation_setting.GetMonitorSetting()
+	if soft {
+		// A lane just re-enabled that answers only timeouts is the relapse
+		// probation exists for; the normal floor of 20 let it serve 19 of them.
+		if inChannelProbation(channelId) {
+			total := failures + successes
+			if m.ChannelProbationMinSamples > 0 && m.ChannelProbationRateThreshold > 0 && total >= m.ChannelProbationMinSamples &&
+				float64(failures)/float64(total) >= m.ChannelProbationRateThreshold {
+				return true
+			}
+		}
+		return channelFailureRateExceeded(m, failures, successes)
+	}
+	// An unbroken run of failures is the cheapest strong signal that the upstream is
+	// down, and it is independent of the window counts - a trickle spread thin never
+	// reaches a count floor.
+	//
+	// It is NOT evidence on a channel that is still serving. Concurrency makes a
+	// "streak" only mean N failures landed with no success BETWEEN them, which a
+	// slow upstream produces constantly: a minute-long GLM completion overlaps
+	// several others, so three timeouts in flight together read as a run while the
+	// channel answers everything else. That pulled 308 working glm channels and
+	// left 3 to carry the load. Once the window holds real successes the rate gate
+	// below is the honest measure, so the streak only decides when there is nothing
+	// to compare against.
+	streak := bumpFailureStreak(channelId)
+	if inChannelProbation(channelId) {
+		probStreak := m.ChannelProbationStreakFloor
+		if probStreak > 0 && streak >= probStreak {
+			return true
+		}
+		total := failures + successes
+		if m.ChannelProbationMinSamples > 0 && m.ChannelProbationRateThreshold > 0 && total >= m.ChannelProbationMinSamples &&
+			float64(failures)/float64(total) >= m.ChannelProbationRateThreshold {
+			return true
+		}
+	}
+	streakFloor := m.ChannelFailureStreakFloor
+	if streakFloor <= 0 {
+		streakFloor = 3
+	}
+	if streak >= streakFloor && successes == 0 {
+		return true
+	}
+	// A channel with no successes at all has nothing to compute a rate against, so a
+	// small floor is the only signal. It must be reachable inside one fixed counter
+	// window: a dead channel on a low-traffic model may only fail a few times per
+	// window and would otherwise stay enabled forever, serving every request an error.
+	if successes == 0 {
+		deadFloor := m.ChannelFailureDeadFloor
+		if deadFloor <= 0 {
+			deadFloor = 5
+		}
+		return failures >= deadFloor
+	}
+	return channelFailureRateExceeded(m, failures, successes)
+}
+
+// A truncation is an upstream failure that landed after content had already
+// reached the client. Nothing can hide it: the retry loop cannot re-answer a
+// request the client is already reading, so the customer sees a cut-off response.
+// It is counted against LONG requests only, because the failure mode is
+// duration-dependent: on one reseller lane the rate was 1.0% under 60s and 79.6%
+// between 120s and 180s, which a whole-traffic rate averages into invisibility.
+//
+// Counting always runs so the rate is observable; only the disable is gated, so
+// the gate can ship inert and be armed once its numbers have been watched.
+func RecordChannelLongRequest(channelId int) {
+	bumpWindowCounter(channelLongRequestCounterKey(channelId), &channelLongRequestCounts, channelId)
+}
+
+// RecordChannelTruncation counts one truncation and reports the window so far plus
+// whether the lane has earned a disable.
+func RecordChannelTruncation(channelId int) (truncations int, total int, exceeded bool) {
+	truncations = bumpWindowCounter(channelTruncationCounterKey(channelId), &channelTruncationCounts, channelId)
+	total = bumpWindowCounter(channelLongRequestCounterKey(channelId), &channelLongRequestCounts, channelId)
+
+	m := operation_setting.GetMonitorSetting()
+	if m.ChannelTruncationRateThreshold <= 0 || m.ChannelTruncationMinSamples <= 0 {
+		return truncations, total, false
+	}
+	if total < m.ChannelTruncationMinSamples {
+		return truncations, total, false
+	}
+	return truncations, total, float64(truncations)/float64(total) >= m.ChannelTruncationRateThreshold
+}
+
+// ChannelTruncationMinDuration is the age a request must reach before it counts
+// toward the truncation window. Zero disables the duration filter.
+func ChannelTruncationMinDuration() time.Duration {
+	return time.Duration(operation_setting.GetMonitorSetting().ChannelTruncationMinDurationSec) * time.Second
+}
+
+// channelFailureRateExceeded is the honest measure once a window holds real
+// traffic: a sustained share of failures, floored so a handful of errors on a
+// quiet lane cannot reach the threshold on their own.
+func channelFailureRateExceeded(m *operation_setting.MonitorSetting, failures, successes int) bool {
+	floor := m.ChannelFailureAbsoluteFloor
+	if floor <= 0 {
+		floor = 20
+	}
+	if failures < floor {
+		return false
+	}
+	if m.ChannelFailureMinSamples <= 0 || m.ChannelFailureRateThreshold <= 0 {
+		return false
+	}
+	total := failures + successes
+	if total < m.ChannelFailureMinSamples {
+		return false
+	}
+	return float64(failures)/float64(total) >= m.ChannelFailureRateThreshold
+}
+
+// ChannelFailureWindow returns the channel's current failure and success counts,
+// for logging why a disable decision went the way it did.
+func ChannelFailureWindow(channelId int) (failures int, successes int) {
+	return readWindowCounter(channelFailureCounterKey(channelId), &channelFailureCounts, channelId),
+		readWindowCounter(channelSuccessCounterKey(channelId), &channelSuccessCounts, channelId)
+}
+
+func shouldCloseActiveWebSocketsAfterDisable(channelId int) bool {
+	channel, err := model.GetChannelById(channelId, true)
+	if err != nil {
+		common.SysLog(common.LogText("failed to check channel status before closing active websockets: channel_id=%d, error=%v", channelId, err))
+		return true
+	}
+	return channel.Status != common.ChannelStatusEnabled
+}
+
+// disable & notify
+func DisableChannel(channelError types.ChannelError, reason string, opts ...model.ChannelStatusChangeOpt) {
+	fails, oks := ChannelFailureWindow(channelError.ChannelId)
+	common.SysLog(fmt.Sprintf("Channel \"%s\" (#%d) encountered an error, preparing to disable (window fail=%d ok=%d). Reason: %s", channelError.ChannelName, channelError.ChannelId, fails, oks, common.LocalLogPreview(reason)))
+
+	// 检查是否启用自动禁用功能
+	if !channelError.AutoBan {
+		common.SysLog(fmt.Sprintf("Channel \"%s\" (#%d) does not have auto-disable enabled, skipping disable operation", channelError.ChannelName, channelError.ChannelId))
+		return
+	}
+
+	success := model.UpdateChannelStatus(channelError.ChannelId, channelError.UsingKey, common.ChannelStatusAutoDisabled, reason, opts...)
+	if success && shouldCloseActiveWebSocketsAfterDisable(channelError.ChannelId) {
+		CloseActiveWebSocketsForChannel(channelError.ChannelId, ChannelDisabledCloseReason)
+	}
+	if success && operation_setting.GetMonitorSetting().ChannelStatusNotifyEnabled {
+		params := map[string]any{"Name": channelError.ChannelName, "Id": channelError.ChannelId, "Reason": reason}
+		NotifyChannelWatchers(formatNotifyType(channelError.ChannelId, common.ChannelStatusAutoDisabled), func(lang string) (string, string) {
+			return i18n.Translate(lang, i18n.MsgChannelNotifyDisabledSubject, params), i18n.Translate(lang, i18n.MsgChannelNotifyDisabledContent, params)
+		})
+	}
+}
+
+func EnableChannel(channelId int, usingKey string, channelName string, opts ...model.ChannelStatusChangeOpt) {
+	success := model.UpdateChannelStatus(channelId, usingKey, common.ChannelStatusEnabled, "", opts...)
+	if success && operation_setting.GetMonitorSetting().ChannelStatusNotifyEnabled {
+		params := map[string]any{"Name": channelName, "Id": channelId}
+		NotifyChannelWatchers(formatNotifyType(channelId, common.ChannelStatusEnabled), func(lang string) (string, string) {
+			return i18n.Translate(lang, i18n.MsgChannelNotifyEnabledSubject, params), i18n.Translate(lang, i18n.MsgChannelNotifyEnabledContent, params)
+		})
+	}
+}
+
+func ShouldDisableChannel(err *types.NewAPIError) bool {
+	if !common.AutomaticDisableChannelEnabled {
+		return false
+	}
+	if err == nil {
+		return false
+	}
+	// An explicitly non-disabling fault (e.g. an empty stream that failed over cleanly):
+	// never auto-ban; a genuinely dead channel is still caught by the scheduled autotest.
+	if types.IsSkipDisableError(err) {
+		return false
+	}
+	if types.IsChannelError(err) {
+		return true
+	}
+	// A local new_api_error (our own sensitive-word filter, request-build failure,
+	// quota gate, etc.) never reached upstream, so the channel is blameless. Never
+	// auto-ban a healthy channel for a request WE rejected locally.
+	if err.GetErrorType() == types.ErrorTypeNewAPIError {
+		return false
+	}
+	if types.IsSkipRetryError(err) {
+		return false
+	}
+	// Content/policy-driven rejections (safety, content_filter, invalid_argument,
+	// etc.) are deterministic, not per-channel faults. Skipping retry without
+	// skipping disable would still auto-ban a healthy channel on a bad request.
+	if operation_setting.IsAlwaysSkipRetryCode(err.GetErrorCode()) {
+		return false
+	}
+	// Not the channel's fault - never auto-ban a healthy channel, even when the
+	// status code is in the disable ranges and the upstream's error code did not
+	// normalize into alwaysSkipRetryCodes:
+	//   - deterministic upstream 400/415/422/451: request-side fault, fails the same
+	//     on every channel;
+	//   - a sampler value no upstream accepts: same body, same rejection everywhere;
+	//   - per-upstream content moderation (400/422): caused by the client's prompt,
+	//     fails over to a less strict sibling. 597 of the 616 channels emitting one
+	//     are serving successful traffic, so this must never pull a lane.
+	if types.IsDeterministicUpstreamError(err) ||
+		types.IsUpstreamModerationError(err) ||
+		types.IsSharedFilterModerationError(err) ||
+		types.IsInvalidParamError(err) {
+		return false
+	}
+	// A transient upstream 400 ("degraded", "retry later", "model name cannot be
+	// empty") is a capacity/flap signal, not a request fault, so it fails over AND
+	// falls through to the caller's failure-RATE guard like a 429: a channel still
+	// serving keeps its successes and survives the rate gate, while one emitting
+	// only these is dead in that costume and gets pulled. Excluding it outright
+	// left a flapping lane serving 34 errors against 28 successes invisible to the
+	// guard, recoverable only by the scheduled autotest hours later.
+	// "User has been banned" from an upstream that runs new-api is ambiguous, and
+	// the wording is identical either way: it means one END USER of ours tripped
+	// their rules (channel healthy - banning it would let a single banned user walk
+	// the whole pool down), or OUR ACCOUNT there is banned (channel permanently
+	// dead). Only behaviour separates them, so fall through to the caller's
+	// failure-RATE guard instead of returning false here: a channel still serving
+	// others keeps its successes and survives the rate gate, while a dead account
+	// trips the zero-success floor. Excluding it outright left 3 reseller channels
+	// enabled on 4,289 errors and zero successes.
+	// A 403 reaching here is a channel-side fault in ~90% of production cases (a
+	// drained upstream wallet, a group the key cannot access, an expired trial, a
+	// plan that does not cover the model), and none of those clear on their own.
+	// ShouldDisableByStatusCode already returns true for it; the caller's
+	// failure-RATE guard is what keeps a one-off refusal from pulling a busy lane.
+	if operation_setting.ShouldDisableByStatusCode(err.StatusCode) {
+		return true
+	}
+
+	lowerMessage := strings.ToLower(err.Error())
+	search, _ := AcSearch(lowerMessage, operation_setting.AutomaticDisableKeywords, true)
+	return search
+}
+
+func ShouldEnableChannel(newAPIError *types.NewAPIError, status int) bool {
+	if !common.AutomaticEnableChannelEnabled {
+		return false
+	}
+	if newAPIError != nil {
+		return false
+	}
+	if status != common.ChannelStatusAutoDisabled {
+		return false
+	}
+	return true
+}

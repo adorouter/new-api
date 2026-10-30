@@ -1,0 +1,765 @@
+package controller
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/aimark"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	relaychannel "github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/system_setting"
+	"github.com/gin-gonic/gin"
+	"golang.org/x/net/http/httpguts"
+)
+
+var errTaskMediaRequestRejected = errors.New("task media request rejected")
+
+var taskMediaResponseHeaderTimeout = 60 * time.Second
+var taskMediaDataURLMaxEncodedBytes = 64 << 20
+
+type taskMediaProxyError struct {
+	status  int
+	code    string
+	message string
+	err     error
+}
+
+func (e *taskMediaProxyError) Error() string {
+	if e.err == nil {
+		return e.message
+	}
+	return e.message + ": " + e.err.Error()
+}
+
+func (e *taskMediaProxyError) Unwrap() error {
+	return e.err
+}
+
+// videoProxyError returns a standardized OpenAI-style error response.
+func videoProxyError(c *gin.Context, status int, errType, message string) {
+	c.Header("Cache-Control", "private, no-store")
+	c.JSON(status, gin.H{
+		"error": gin.H{
+			"message": message,
+			"type":    errType,
+		},
+	})
+}
+
+func VideoProxy(c *gin.Context) {
+	taskID := c.Param("task_id")
+	if taskID == "" {
+		videoProxyError(c, http.StatusBadRequest, "invalid_request_error", "task_id is required")
+		return
+	}
+
+	task, exists, err := getTaskForArtifactRequest(c, taskID)
+	if err != nil {
+		logger.LogError(c.Request.Context(), common.LogText("Failed to query task %s: %s", taskID, err.Error()))
+		videoProxyError(c, http.StatusInternalServerError, "server_error", "Failed to query task")
+		return
+	}
+	if !exists || task == nil {
+		videoProxyError(c, http.StatusNotFound, "invalid_request_error", "Task not found")
+		return
+	}
+	if task.Status != model.TaskStatusSuccess {
+		videoProxyError(c, http.StatusBadRequest, "invalid_request_error",
+			fmt.Sprintf("Task is not completed yet, current status: %s", task.Status))
+		return
+	}
+
+	var descriptor *relaychannel.TaskContentRequest
+	if taskHasPluginExecution(task) {
+		artifacts, projectionErr := projectTaskArtifacts(task)
+		if projectionErr == nil {
+			for _, artifact := range artifacts {
+				if artifact.Type != "video" {
+					continue
+				}
+				adaptor, adaptorErr := initTaskArtifactAdaptor(task)
+				if adaptorErr == nil {
+					if provider, ok := adaptor.(relaychannel.TaskContentRequestProvider); ok {
+						descriptor, adaptorErr = provider.BuildContentRequest(c.Request.Context(), task, artifact.Key, relaychannel.TaskArtifactClientRequest{
+							Method:  c.Request.Method,
+							Headers: taskArtifactClientHeaders(c.Request),
+						})
+					}
+				}
+				if adaptorErr != nil {
+					logger.LogWarn(c.Request.Context(), common.LogText("Failed to resolve plugin video content for task %s: %v", taskID, adaptorErr))
+					descriptor = nil
+				}
+				break
+			}
+		} else {
+			logger.LogWarn(c.Request.Context(), common.LogText("Failed to project plugin video for task %s", taskID))
+		}
+	}
+	if descriptor == nil {
+		resultURL := task.GetResultURL()
+		if isTaskMediaFallbackLoop(resultURL, task.TaskID) {
+			// The poller parked the bytes in task.Data and stored a self-referencing
+			// proxy URL; serve the inlined image instead of looping back here.
+			// `?index=N` selects which image in a batch (0-based).
+			idx := 0
+			if raw := strings.TrimSpace(c.Query("index")); raw != "" {
+				if n, convErr := strconv.Atoi(raw); convErr == nil && n >= 0 {
+					idx = n
+				}
+			}
+			if dataURL := extractDataURLFromTaskData(task, idx); dataURL != "" {
+				if writeErr := writeVideoDataURL(c, dataURL); writeErr != nil {
+					logger.LogError(c.Request.Context(), fmt.Sprintf("Failed to decode video data URL for task %s: %s", taskID, writeErr.Error()))
+					writeTaskMediaProxyError(c, &taskMediaProxyError{
+						status: http.StatusBadGateway, code: "artifact_upstream_error",
+						message: "Failed to fetch video content",
+					})
+				}
+				return
+			}
+			writeTaskMediaProxyError(c, &taskMediaProxyError{
+				status: http.StatusGone, code: "artifact_gone",
+				message: "Artifact content is no longer available",
+			})
+			return
+		}
+
+		descriptor = &relaychannel.TaskContentRequest{
+			URL:            resultURL,
+			Method:         c.Request.Method,
+			Credentialless: true,
+		}
+
+	}
+	if err := proxyTaskMedia(c, task, descriptor); err != nil {
+		writeTaskMediaProxyError(c, err)
+	}
+}
+
+// extractDataURLFromTaskData walks the raw upstream response we cached in
+// task.Data (currently used by the comfyui/runpod path) looking for an
+// inlined image. Returns a data: URI ready for writeVideoDataURL or "".
+//
+// idx selects which image in a batch to return (0-based). Out-of-range
+// requests return "" so the caller surfaces a 502 rather than silently
+// substituting a different image. idx=0 preserves the original
+// single-image behaviour.
+//
+// Known shapes:
+//   - RunPod worker-comfyui: { "output": { "images": [{"data": "<b64>", "filename": "...png"}] } }
+//   - Generic data URI parked in any string field
+//
+// We avoid a full recursive walker — too easy to grab user-prompt echoes by
+// accident. The two paths above cover the cases we actually emit today.
+func extractDataURLFromTaskData(task *model.Task, idx int) string {
+	raw, err := task.Data.MarshalJSON()
+	if err != nil || len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var envelope struct {
+		Output struct {
+			Images []struct {
+				Data     string `json:"data"`
+				Filename string `json:"filename"`
+				URL      string `json:"url"`
+			} `json:"images"`
+		} `json:"output"`
+	}
+	if err := common.Unmarshal(raw, &envelope); err == nil {
+		if idx < 0 || idx >= len(envelope.Output.Images) {
+			return ""
+		}
+		img := envelope.Output.Images[idx]
+		if strings.HasPrefix(img.URL, "data:") {
+			return img.URL
+		}
+		if img.Data != "" {
+			mime := "image/png"
+			if strings.HasSuffix(strings.ToLower(img.Filename), ".jpg") || strings.HasSuffix(strings.ToLower(img.Filename), ".jpeg") {
+				mime = "image/jpeg"
+			} else if strings.HasSuffix(strings.ToLower(img.Filename), ".webp") {
+				mime = "image/webp"
+			}
+			return "data:" + mime + ";base64," + img.Data
+		}
+	}
+	return ""
+}
+
+func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.TaskContentRequest) error {
+	if descriptor == nil {
+		return &taskMediaProxyError{
+			status: http.StatusInternalServerError, code: "artifact_plugin_error",
+			message: "Artifact content plugin returned no request",
+		}
+	}
+	rawURL := strings.TrimSpace(descriptor.URL)
+	if rawURL == "" {
+		return &taskMediaProxyError{
+			status: http.StatusGone, code: "artifact_gone",
+			message: "Artifact content is no longer available",
+		}
+	}
+	if strings.HasPrefix(rawURL, "data:") {
+		if len(rawURL) > taskMediaDataURLMaxEncodedBytes {
+			return &taskMediaProxyError{
+				status: http.StatusBadGateway, code: "artifact_request_rejected",
+				message: "Artifact request was rejected", err: errTaskMediaRequestRejected,
+			}
+		}
+		if err := writeVideoDataURL(c, rawURL); err != nil {
+			return &taskMediaProxyError{
+				status: http.StatusBadGateway, code: "artifact_upstream_error",
+				message: "Failed to decode artifact content", err: err,
+			}
+		}
+		return nil
+	}
+	if len(rawURL) > 64<<10 {
+		return &taskMediaProxyError{
+			status: http.StatusBadGateway, code: "artifact_request_rejected",
+			message: "Artifact request was rejected", err: errTaskMediaRequestRejected,
+		}
+	}
+
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil || parsedURL == nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") ||
+		parsedURL.Host == "" || parsedURL.User != nil || parsedURL.Fragment != "" {
+		return &taskMediaProxyError{
+			status: http.StatusBadGateway, code: "artifact_request_rejected",
+			message: "Artifact request was rejected", err: errTaskMediaRequestRejected,
+		}
+	}
+	if isTaskMediaFallbackLoop(rawURL, task.TaskID) || isSelfTaskMediaURL(c, parsedURL) {
+		return &taskMediaProxyError{
+			status: http.StatusBadGateway, code: "artifact_request_rejected",
+			message: "Artifact proxy loop was rejected", err: errTaskMediaRequestRejected,
+		}
+	}
+
+	method := strings.ToUpper(strings.TrimSpace(descriptor.Method))
+	if method == "" {
+		method = c.Request.Method
+	}
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodPost:
+	default:
+		return &taskMediaProxyError{
+			status: http.StatusBadGateway, code: "artifact_request_rejected",
+			message: "Artifact request method was rejected", err: errTaskMediaRequestRejected,
+		}
+	}
+	if len(descriptor.Body) > 1<<20 {
+		return &taskMediaProxyError{
+			status: http.StatusBadGateway, code: "artifact_request_rejected",
+			message: "Artifact request body was rejected", err: errTaskMediaRequestRejected,
+		}
+	}
+	if descriptor.Credentialless &&
+		(method != http.MethodGet && method != http.MethodHead ||
+			descriptor.Body != nil || len(descriptor.Headers) != 0) {
+		return &taskMediaProxyError{
+			status: http.StatusBadGateway, code: "artifact_request_rejected",
+			message: "Credentialless artifact request was rejected", err: errTaskMediaRequestRejected,
+		}
+	}
+
+	channel, err := model.CacheGetChannel(task.ChannelId)
+	if err != nil {
+		return &taskMediaProxyError{
+			status: http.StatusServiceUnavailable, code: "artifact_plugin_unavailable",
+			message: "Artifact channel is unavailable", err: err,
+		}
+	}
+	setting := channel.GetSetting()
+	proxy := strings.TrimSpace(setting.Proxy)
+	if err := validateTaskMediaURL(rawURL, proxy); err != nil {
+		return &taskMediaProxyError{
+			status: http.StatusBadGateway, code: "artifact_request_rejected",
+			message: "Artifact request was rejected", err: err,
+		}
+	}
+
+	client := service.GetSSRFProtectedHTTPClient()
+	if proxy != "" {
+		client, err = service.GetHttpClientWithProxySettings(proxy, setting)
+		if err != nil {
+			return &taskMediaProxyError{
+				status: http.StatusInternalServerError, code: "artifact_internal_error",
+				message: "Failed to create artifact proxy client", err: err,
+			}
+		}
+	}
+	if client == nil {
+		client = http.DefaultClient
+	}
+
+	if method != http.MethodPost && descriptor.Body == nil && c.Request.Header.Get("Range") != "" {
+		key := "task\x00" + task.TaskID + "\x00" + c.Request.URL.Path + "?" + c.Request.URL.RawQuery
+		if serveMarkedMP4Range(c, key, taskMediaRangeFetcher(c, client, proxy, parsedURL.String(), descriptor)) {
+			return nil
+		}
+	}
+
+	req, err := http.NewRequestWithContext(c.Request.Context(), method, parsedURL.String(), bytes.NewReader(descriptor.Body))
+	if err != nil {
+		return &taskMediaProxyError{
+			status: http.StatusInternalServerError, code: "artifact_internal_error",
+			message: "Failed to create artifact request", err: err,
+		}
+	}
+	if err := applyTaskMediaRequestHeaders(req.Header, descriptor.Headers); err != nil {
+		return &taskMediaProxyError{
+			status: http.StatusBadGateway, code: "artifact_request_rejected",
+			message: "Artifact request headers were rejected", err: err,
+		}
+	}
+	clientHeaders := taskArtifactClientHeaders(c.Request)
+	for name, value := range clientHeaders {
+		req.Header.Set(name, value)
+	}
+	openRange := isOpenRangeFromStart(c.Request)
+	if openRange {
+		req.Header.Del("Range")
+		req.Header.Del("If-Range")
+	}
+
+	client = taskMediaRedirectClient(client, proxy, c, clientHeaders, descriptor.Credentialless)
+	clientWithoutBodyTimeout := *client
+	clientWithoutBodyTimeout.Timeout = 0
+	resp, err := doTaskMediaRequest(&clientWithoutBodyTimeout, req, taskMediaResponseHeaderTimeout)
+	if err != nil {
+		if errors.Is(err, errTaskMediaRequestRejected) {
+			return &taskMediaProxyError{
+				status: http.StatusBadGateway, code: "artifact_request_rejected",
+				message: "Artifact redirect was rejected", err: err,
+			}
+		}
+		var netErr net.Error
+		if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &netErr) && netErr.Timeout() {
+			return &taskMediaProxyError{
+				status: http.StatusGatewayTimeout, code: "artifact_upstream_timeout",
+				message: "Artifact upstream request timed out", err: err,
+			}
+		}
+		return &taskMediaProxyError{
+			status: http.StatusBadGateway, code: "artifact_upstream_error",
+			message: "Failed to fetch artifact content", err: err,
+		}
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusPartialContent, http.StatusNotModified, http.StatusRequestedRangeNotSatisfiable:
+		body := io.Reader(resp.Body)
+		var markedImage []byte
+		streamMP4 := false
+		// Range and HEAD requests pass through unmarked, since the mark changes lengths and offsets.
+		if resp.StatusCode == http.StatusOK && c.Request.Method == http.MethodGet && (openRange || c.Request.Header.Get("Range") == "") {
+			buffered := bufio.NewReader(resp.Body)
+			body = buffered
+			head, _ := buffered.Peek(16)
+			switch {
+			case aimark.IsImage(head) && resp.ContentLength <= markedMediaImageMaxBytes:
+				data, err := io.ReadAll(io.LimitReader(buffered, markedMediaImageMaxBytes+1))
+				if err != nil {
+					return &taskMediaProxyError{
+						status: http.StatusBadGateway, code: "artifact_upstream_error",
+						message: "Failed to fetch artifact content", err: err,
+					}
+				}
+				body = io.MultiReader(bytes.NewReader(data), buffered)
+				if len(data) <= markedMediaImageMaxBytes {
+					if marked, ok := aimark.Mark(data); ok {
+						markedImage = marked
+					}
+				}
+			case aimark.IsMP4(head):
+				streamMP4 = true
+			}
+		}
+		header := c.Writer.Header()
+		copyTaskMediaResponseHeaders(header, resp.Header)
+		setTaskMediaResponseSecurityHeaders(header)
+		if markedImage != nil || streamMP4 {
+			header.Del("Accept-Ranges")
+			header.Del("Content-Length")
+		}
+		if markedImage != nil {
+			header.Set("Content-Length", strconv.Itoa(len(markedImage)))
+			body = bytes.NewReader(markedImage)
+		}
+		c.Status(resp.StatusCode)
+		c.Writer.WriteHeaderNow()
+		if c.Request.Method == http.MethodHead || resp.StatusCode == http.StatusNotModified {
+			return nil
+		}
+		if streamMP4 {
+			err = copyMarkedMP4(c.Writer, body)
+		} else {
+			_, err = io.Copy(c.Writer, body)
+		}
+		if err != nil {
+			logger.LogError(c.Request.Context(), common.LogText("Failed to stream task media: %v", err))
+		}
+		return nil
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return &taskMediaProxyError{
+			status: http.StatusBadGateway, code: "artifact_upstream_auth_failed",
+			message: "Artifact upstream authentication failed",
+		}
+	case http.StatusNotFound, http.StatusGone:
+		return &taskMediaProxyError{
+			status: http.StatusGone, code: "artifact_gone",
+			message: "Artifact content is no longer available",
+		}
+	case http.StatusTooManyRequests:
+		if retryAfter := strings.TrimSpace(resp.Header.Get("Retry-After")); retryAfter != "" &&
+			len(retryAfter) <= 256 && !strings.ContainsAny(retryAfter, "\r\n") {
+			c.Header("Retry-After", retryAfter)
+		}
+		return &taskMediaProxyError{
+			status: http.StatusServiceUnavailable, code: "artifact_upstream_busy",
+			message: "Artifact upstream is busy",
+		}
+	default:
+		return &taskMediaProxyError{
+			status: http.StatusBadGateway, code: "artifact_upstream_error",
+			message: fmt.Sprintf("Artifact upstream returned status %d", resp.StatusCode),
+		}
+	}
+}
+
+func taskMediaRangeFetcher(c *gin.Context, client *http.Client, proxy, rawURL string, descriptor *relaychannel.TaskContentRequest) mp4RangeFetcher {
+	return func(ctx context.Context, rangeHeader, ifRange string) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		if err := applyTaskMediaRequestHeaders(req.Header, descriptor.Headers); err != nil {
+			return nil, err
+		}
+		for _, name := range []string{"If-Range", "If-None-Match", "If-Modified-Since"} {
+			req.Header.Del(name)
+		}
+		rangeHeaders := map[string]string{"Range": rangeHeader}
+		if ifRange != "" {
+			rangeHeaders["If-Range"] = ifRange
+		}
+		for name, value := range rangeHeaders {
+			req.Header.Set(name, value)
+		}
+		redirectClient := *taskMediaRedirectClient(client, proxy, c, rangeHeaders, descriptor.Credentialless)
+		redirectClient.Timeout = 0
+		return doTaskMediaRequest(&redirectClient, req, taskMediaResponseHeaderTimeout)
+	}
+}
+
+type taskMediaHTTPResult struct {
+	response *http.Response
+	err      error
+}
+
+type taskMediaCancelBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (b *taskMediaCancelBody) Close() error {
+	b.once.Do(b.cancel)
+	return b.ReadCloser.Close()
+}
+
+func doTaskMediaRequest(client *http.Client, request *http.Request, responseHeaderTimeout time.Duration) (*http.Response, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	requestContext, cancel := context.WithCancel(request.Context())
+	request = request.Clone(requestContext)
+	resultChannel := make(chan taskMediaHTTPResult, 1)
+	go func() {
+		response, err := client.Do(request)
+		resultChannel <- taskMediaHTTPResult{response: response, err: err}
+	}()
+
+	timer := time.NewTimer(responseHeaderTimeout)
+	defer timer.Stop()
+	cleanupResult := func() {
+		go func() {
+			result := <-resultChannel
+			if result.response != nil && result.response.Body != nil {
+				_ = result.response.Body.Close()
+			}
+		}()
+	}
+
+	select {
+	case result := <-resultChannel:
+		if result.err != nil {
+			cancel()
+			if result.response != nil && result.response.Body != nil {
+				_ = result.response.Body.Close()
+			}
+			return nil, result.err
+		}
+		if result.response == nil || result.response.Body == nil {
+			cancel()
+			return nil, errors.New("artifact upstream returned no response body")
+		}
+		result.response.Body = &taskMediaCancelBody{
+			ReadCloser: result.response.Body,
+			cancel:     cancel,
+		}
+		return result.response, nil
+	case <-timer.C:
+		cancel()
+		cleanupResult()
+		return nil, context.DeadlineExceeded
+	case <-request.Context().Done():
+		cancel()
+		cleanupResult()
+		return nil, request.Context().Err()
+	}
+}
+
+func applyTaskMediaRequestHeaders(destination http.Header, headers map[string]string) error {
+	if jsplugin.ValidateRequestHeaders(headers) != nil {
+		return errTaskMediaRequestRejected
+	}
+	for name, value := range headers {
+		destination.Set(strings.TrimSpace(name), value)
+	}
+	return nil
+}
+
+func taskMediaRedirectClient(base *http.Client, proxy string, c *gin.Context, clientHeaders map[string]string, credentialless bool) *http.Client {
+	cloned := *base
+	cloned.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return fmt.Errorf("%w: too many redirects", errTaskMediaRequestRejected)
+		}
+		if req.URL == nil || (req.URL.Scheme != "http" && req.URL.Scheme != "https") ||
+			req.URL.Host == "" || req.URL.User != nil || req.URL.Fragment != "" {
+			return fmt.Errorf("%w: invalid redirect URL", errTaskMediaRequestRejected)
+		}
+		if err := validateTaskMediaURL(req.URL.String(), proxy); err != nil {
+			return fmt.Errorf("%w: %v", errTaskMediaRequestRejected, err)
+		}
+		if isSelfTaskMediaURL(c, req.URL) {
+			return fmt.Errorf("%w: proxy loop", errTaskMediaRequestRejected)
+		}
+		if len(via) > 0 && !sameTaskMediaOrigin(via[len(via)-1].URL, req.URL) {
+			if !credentialless {
+				return fmt.Errorf("%w: credentialed cross-origin redirect", errTaskMediaRequestRejected)
+			}
+			for name := range req.Header {
+				req.Header.Del(name)
+			}
+			req.Body = http.NoBody
+			req.GetBody = nil
+			req.ContentLength = 0
+		}
+		for name, value := range clientHeaders {
+			req.Header.Set(name, value)
+		}
+		return nil
+	}
+	return &cloned
+}
+
+func validateTaskMediaURL(rawURL, proxy string) error {
+	if proxy == "" {
+		return service.ValidateSSRFProtectedFetchURL(rawURL)
+	}
+	fetchSetting := system_setting.GetFetchSetting()
+	return common.ValidateURLWithFetchSetting(
+		rawURL,
+		fetchSetting.EnableSSRFProtection,
+		fetchSetting.AllowPrivateIp,
+		fetchSetting.DomainFilterMode,
+		fetchSetting.IpFilterMode,
+		fetchSetting.DomainList,
+		fetchSetting.IpList,
+		fetchSetting.AllowedPorts,
+		fetchSetting.ApplyIPFilterForDomain,
+	)
+}
+
+func sameTaskMediaOrigin(left, right *url.URL) bool {
+	if left == nil || right == nil {
+		return false
+	}
+	return strings.EqualFold(left.Scheme, right.Scheme) &&
+		strings.EqualFold(normalizeTaskMediaHost(left.Scheme, left.Host), normalizeTaskMediaHost(right.Scheme, right.Host))
+}
+
+func normalizeTaskMediaHost(scheme, host string) string {
+	host = strings.ToLower(strings.TrimSpace(host))
+	hostname, port, err := net.SplitHostPort(host)
+	if err != nil {
+		return strings.TrimSuffix(host, ".")
+	}
+	hostname = strings.TrimSuffix(strings.ToLower(hostname), ".")
+	if (strings.EqualFold(scheme, "http") && port == "80") || (strings.EqualFold(scheme, "https") && port == "443") {
+		return hostname
+	}
+	return net.JoinHostPort(hostname, port)
+}
+
+func isSelfTaskMediaURL(c *gin.Context, target *url.URL) bool {
+	if c == nil || target == nil || !isTaskMediaProxyPath(target.Path) {
+		return false
+	}
+	targetHost := normalizeTaskMediaHost(target.Scheme, target.Host)
+	if targetHost == "" {
+		return true
+	}
+	scheme := strings.TrimSpace(strings.Split(c.Request.Header.Get("X-Forwarded-Proto"), ",")[0])
+	if scheme == "" {
+		scheme = "http"
+		if c.Request.TLS != nil {
+			scheme = "https"
+		}
+	}
+	hosts := []string{c.Request.Host}
+	if forwardedHost := strings.TrimSpace(strings.Split(c.Request.Header.Get("X-Forwarded-Host"), ",")[0]); forwardedHost != "" {
+		hosts = append(hosts, forwardedHost)
+	}
+	for _, host := range hosts {
+		if strings.EqualFold(targetHost, normalizeTaskMediaHost(scheme, host)) {
+			return true
+		}
+	}
+	return false
+}
+
+func isTaskMediaProxyPath(path string) bool {
+	if strings.HasPrefix(path, "/v1/videos/") && strings.HasSuffix(path, "/content") {
+		return true
+	}
+	return strings.HasPrefix(path, "/v1/tasks/") &&
+		strings.Contains(path, "/artifacts/") &&
+		strings.HasSuffix(path, "/content")
+}
+
+func isTaskMediaFallbackLoop(rawURL, taskID string) bool {
+	parsedURL, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsedURL == nil {
+		return false
+	}
+	path, err := url.PathUnescape(parsedURL.EscapedPath())
+	if err != nil {
+		path = parsedURL.Path
+	}
+	if path == "/v1/videos/"+taskID+"/content" {
+		return true
+	}
+	artifactPrefix := "/v1/tasks/" + taskID + "/artifacts/"
+	return strings.HasPrefix(path, artifactPrefix) && strings.HasSuffix(path, "/content")
+}
+
+// isOpenRangeFromStart reports a GET for bytes=0-, which browsers send first for a
+// video element and which may be answered with the whole file as a 200.
+func isOpenRangeFromStart(request *http.Request) bool {
+	return request.Method == http.MethodGet && strings.TrimSpace(request.Header.Get("Range")) == "bytes=0-"
+}
+
+func copyTaskMediaResponseHeaders(destination, source http.Header) {
+	for _, name := range []string{
+		"Content-Type",
+		"Content-Length",
+		"Content-Range",
+		"Accept-Ranges",
+		"ETag",
+		"Last-Modified",
+		"Content-Disposition",
+	} {
+		for _, value := range source.Values(name) {
+			destination.Add(name, value)
+		}
+	}
+}
+
+func setTaskMediaResponseSecurityHeaders(header http.Header) {
+	header.Set("Cache-Control", "private, no-store")
+	header.Set("Content-Security-Policy", "sandbox; default-src 'none'")
+	header.Set("Referrer-Policy", "no-referrer")
+	header.Set("X-Content-Type-Options", "nosniff")
+}
+
+func writeTaskMediaProxyError(c *gin.Context, err error) {
+	if c.Writer.Written() {
+		logger.LogError(c.Request.Context(), err.Error())
+		return
+	}
+	var proxyErr *taskMediaProxyError
+	if !errors.As(err, &proxyErr) {
+		proxyErr = &taskMediaProxyError{
+			status: http.StatusBadGateway, code: "artifact_upstream_error",
+			message: "Failed to fetch artifact content", err: err,
+		}
+	}
+	c.Header("Cache-Control", "private, no-store")
+	writeTaskArtifactError(c, proxyErr.status, proxyErr.code, proxyErr.message)
+}
+
+func writeVideoDataURL(c *gin.Context, dataURL string) error {
+	if len(dataURL) > taskMediaDataURLMaxEncodedBytes {
+		return errTaskMediaRequestRejected
+	}
+	parts := strings.SplitN(dataURL, ",", 2)
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid data url")
+	}
+
+	header := parts[0]
+	payload := parts[1]
+	if !strings.HasPrefix(header, "data:") || !strings.Contains(header, ";base64") {
+		return fmt.Errorf("unsupported data url")
+	}
+
+	mimeType := strings.TrimPrefix(header, "data:")
+	mimeType = strings.TrimSuffix(mimeType, ";base64")
+	if mimeType == "" {
+		mimeType = "video/mp4"
+	}
+	if len(mimeType) > 255 || !httpguts.ValidHeaderFieldValue(mimeType) {
+		return fmt.Errorf("invalid data url media type")
+	}
+
+	content, err := base64.StdEncoding.DecodeString(payload)
+	if err != nil {
+		if content, err = base64.RawStdEncoding.DecodeString(payload); err != nil {
+			return fmt.Errorf("invalid base64 data")
+		}
+	}
+	content, _ = aimark.Mark(content)
+
+	c.Writer.Header().Set("Content-Type", mimeType)
+	c.Writer.Header().Set("Content-Length", strconv.Itoa(len(content)))
+	setTaskMediaResponseSecurityHeaders(c.Writer.Header())
+	c.Writer.WriteHeader(http.StatusOK)
+	if c.Request.Method == http.MethodHead {
+		return nil
+	}
+	_, err = c.Writer.Write(content)
+	return err
+}

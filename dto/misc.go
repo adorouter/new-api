@@ -1,0 +1,140 @@
+package dto
+
+// TestStatusData is the response data for GET /api/status/test.
+type TestStatusData struct {
+	HttpStats any `json:"http_stats"`
+}
+
+// StatusData is the response data for GET /api/status.
+type StatusData struct {
+	Version                  string `json:"version"`
+	StartTime                int64  `json:"start_time"`
+	EmailVerification        bool   `json:"email_verification"`
+	GitHubOAuth              bool   `json:"github_oauth"`
+	GitHubClientId           string `json:"github_client_id"`
+	DiscordOAuth             bool   `json:"discord_oauth"`
+	DiscordClientId          string `json:"discord_client_id"`
+	GoogleOAuth              bool   `json:"google_oauth"`
+	GoogleClientId           string `json:"google_client_id"`
+	LinuxDOOAuth             bool   `json:"linuxdo_oauth"`
+	LinuxDOClientId          string `json:"linuxdo_client_id"`
+	LinuxDOMinimumTrustLevel int    `json:"linuxdo_minimum_trust_level"`
+	TelegramOAuth            bool   `json:"telegram_oauth"`
+	TelegramOAuthConfigured  bool   `json:"telegram_oauth_configured"`
+	TelegramBotName          string `json:"telegram_bot_name"`
+	Theme                    string `json:"theme"`
+	SystemName               string `json:"system_name"`
+	Logo                     string `json:"logo"`
+	FooterHtml               string `json:"footer_html"`
+	WeChatQrcode             string `json:"wechat_qrcode"`
+	WeChatLogin              bool   `json:"wechat_login"`
+	ServerAddress            string `json:"server_address"`
+	TurnstileCheck           bool   `json:"turnstile_check"`
+	// A missing consent blocks the request; the chat BFF applies the same switch to guests.
+	ConsentEnforced bool `json:"consent_enforced"`
+	// Models whose consent is enforced before the global switch; the BFF applies it to guests.
+	ConsentEnforcedModels      []string    `json:"consent_enforced_models"`
+	TurnstileSiteKey           string      `json:"turnstile_site_key"`
+	TopUpLink                  string      `json:"top_up_link"`
+	DocsLink                   string      `json:"docs_link"`
+	QuotaPerUnit               float64     `json:"quota_per_unit"`
+	DisplayInCurrency          bool        `json:"display_in_currency"`
+	QuotaDisplayType           string      `json:"quota_display_type"`
+	CustomCurrencySymbol       string      `json:"custom_currency_symbol"`
+	CustomCurrencyExchangeRate float64     `json:"custom_currency_exchange_rate"`
+	EnableBatchUpdate          bool        `json:"enable_batch_update"`
+	EnableDrawing              bool        `json:"enable_drawing"`
+	EnableTask                 bool        `json:"enable_task"`
+	EnableDataExport           bool        `json:"enable_data_export"`
+	DataExportDefaultTime      string      `json:"data_export_default_time"`
+	DefaultCollapseSidebar     bool        `json:"default_collapse_sidebar"`
+	MjNotifyEnabled            bool        `json:"mj_notify_enabled"`
+	Chats                      []ChatEntry `json:"chats"`
+	DemoSiteEnabled            bool        `json:"demo_site_enabled"`
+	SelfUseModeEnabled         bool        `json:"self_use_mode_enabled"`
+	DefaultUseAutoGroup        bool        `json:"default_use_auto_group"`
+	UsdExchangeRate            float64     `json:"usd_exchange_rate"`
+	Price                      float64     `json:"price"`
+	StripeUnitPrice            float64     `json:"stripe_unit_price"`
+	ApiInfoEnabled             bool        `json:"api_info_enabled"`
+	UptimeKumaEnabled          bool        `json:"uptime_kuma_enabled"`
+	AnnouncementsEnabled       bool        `json:"announcements_enabled"`
+	FaqEnabled                 bool        `json:"faq_enabled"`
+	HeaderNavModules           string      `json:"HeaderNavModules"`
+	SidebarModulesAdmin        string      `json:"SidebarModulesAdmin"`
+	OidcEnabled                bool        `json:"oidc_enabled"`
+	OidcClientId               string      `json:"oidc_client_id"`
+	OidcAuthorizationEndpoint  string      `json:"oidc_authorization_endpoint"`
+	OidcDisplayName            string      `json:"oidc_display_name"`
+	PasskeyLogin               bool        `json:"passkey_login"`
+	PasskeyDisplayName         string      `json:"passkey_display_name"`
+	PasskeyRpId                string      `json:"passkey_rp_id"`
+	PasskeyRpIds               []string    `json:"passkey_rp_ids"`
+	PasskeyAllowInsecure       bool        `json:"passkey_allow_insecure"`
+	PasskeyUserVerification    string      `json:"passkey_user_verification"`
+	PasskeyAttachment          string      `json:"passkey_attachment"`
+	Setup                      bool        `json:"setup"`
+	UserAgreementEnabled       bool        `json:"user_agreement_enabled"`
+	UserAgreementUrl           string      `json:"user_agreement_url,omitempty"`
+	PrivacyPolicyEnabled       bool        `json:"privacy_policy_enabled"`
+	PrivacyPolicyUrl           string      `json:"privacy_policy_url,omitempty"`
+	AboutUrl                   string      `json:"about_url,omitempty"`
+	CheckinEnabled             bool        `json:"checkin_enabled"`
+	PasswordLoginEnabled       bool        `json:"password_login_enabled"`
+	PasswordRegisterEnabled    bool        `json:"password_register_enabled"`
+	LogExportEnabled           bool        `json:"log_export_enabled"`
+	LogMaxRangeDays            int         `json:"log_max_range_days"`
+	QuotaRemindEnabled         bool        `json:"quota_remind_enabled"`
+	QuotaRemindThreshold       int         `json:"quota_remind_threshold"`
+	// Upstream returns this in the status payload; prod's typed DTO drops any
+	// field it does not declare, so the frontend never sees it without this.
+	PasswordLoginEncryptionEnabled bool                `json:"password_login_encryption_enabled"`
+	RegisterEnabled                bool                `json:"register_enabled"`
+	QN                             string              `json:"_qn"`
+	ApiInfo                        []ApiInfoEntry      `json:"api_info,omitempty"`
+	Announcements                  []AnnouncementEntry `json:"announcements,omitempty"`
+	FAQ                            []FAQEntry          `json:"faq,omitempty"`
+	CustomOAuthProviders           []CustomOAuthInfo   `json:"custom_oauth_providers,omitempty"`
+}
+
+// PasswordResetRequest is the request body for POST /api/user/reset.
+type PasswordResetRequest struct {
+	Email string `json:"email"`
+	Token string `json:"token"`
+}
+
+// ApiInfoEntry represents a single API info item displayed on the console dashboard.
+type ApiInfoEntry struct {
+	URL         string `json:"url"`
+	Route       string `json:"route"`
+	Description string `json:"description"`
+	Color       string `json:"color"`
+}
+
+// AnnouncementEntry represents a single announcement displayed on the console dashboard.
+type AnnouncementEntry struct {
+	Content     string `json:"content"`
+	PublishDate string `json:"publishDate"`
+	Type        string `json:"type,omitempty"`
+	Extra       string `json:"extra,omitempty"`
+}
+
+// FAQEntry represents a single FAQ item displayed on the console dashboard.
+type FAQEntry struct {
+	Question string `json:"question"`
+	Answer   string `json:"answer"`
+}
+
+// ChatEntry represents a chat application link (name → URL mapping).
+type ChatEntry = map[string]string
+
+// CustomOAuthInfo is a client-facing projection of a custom OAuth provider for the status endpoint.
+type CustomOAuthInfo struct {
+	Id                    int    `json:"id"`
+	Name                  string `json:"name"`
+	Slug                  string `json:"slug"`
+	Icon                  string `json:"icon"`
+	ClientId              string `json:"client_id"`
+	AuthorizationEndpoint string `json:"authorization_endpoint"`
+	Scopes                string `json:"scopes"`
+}

@@ -1,0 +1,149 @@
+package operation_setting
+
+import (
+	"os"
+	"strings"
+
+	"github.com/QuantumNous/new-api/relaykit/types"
+)
+
+func init() {
+	// Feed the admin-editable channel-fault keyword list into the types package
+	// (which does the error reclassification but cannot import this package).
+	types.ChannelFaultKeywordsProvider = func() []string { return ChannelFaultKeywords }
+	types.SharedFilterModerationMarkersProvider = func() []string { return SharedFilterModerationMarkers }
+}
+
+// Moderation rejects that every sibling lane repeats, because those lanes front
+// a single guest endpoint. Seeded from SHARED_FILTER_MODERATION_MARKERS (comma
+// separated) rather than written here: the fragments name the upstream a lane
+// fronts and this repo is public. Empty means the chain never short circuits on
+// a moderation verdict, which is how it behaved before the markers existed.
+var SharedFilterModerationMarkers = parseMarkerList(os.Getenv("SHARED_FILTER_MODERATION_MARKERS"))
+
+// Upstream texts that name the upstream itself, kept out of this public repo the
+// same way: extra markers for the one minute and fifteen minute window rules, and
+// for canned 200 replies.
+var MinuteWindowMarkers = parseMarkerList(os.Getenv("MINUTE_WINDOW_MARKERS"))
+var QuarterHourWindowMarkers = parseMarkerList(os.Getenv("QUARTER_HOUR_WINDOW_MARKERS"))
+var CannedReplyMarkers = parseMarkerList(os.Getenv("CANNED_REPLY_MARKERS"))
+
+func parseMarkerList(raw string) []string {
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if trimmed := strings.ToLower(strings.TrimSpace(part)); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+var DemoSiteEnabled = false
+var SelfUseModeEnabled = false
+var ShowOriginalPriceEnabled = false
+
+var AutomaticDisableKeywords = []string{
+	"Your credit balance is too low",
+	"This organization has been disabled.",
+	"You exceeded your current quota",
+	"Permission denied",
+	"The security token included in the request is invalid",
+	"Operation not allowed",
+	"Your account is not authorized",
+}
+
+// ChannelFaultKeywords: upstream error fragments that mean THIS channel is at
+// fault (dead key, drained upstream wallet, exhausted free quota) rather than the
+// client's request. Unlike AutomaticDisableKeywords (disable only), a match here
+// on a 400/403 ALSO reclassifies the error to a channel fault so the SAME request
+// fails over to a healthy sibling. Admin-editable option (standard OptionMap
+// flow: these are the code defaults, a saved DB row overrides them); matched
+// case-insensitively.
+var ChannelFaultKeywords = []string{
+	"api key not valid",
+	"api key expired",
+	"api_key_invalid",
+	"external billing pre-consume: insufficient balance",
+	// Both forms: upstreams running new-api still emit the Chinese text.
+	"insufficient user quota",
+	"用户额度不足",
+	"剩余额度",
+	// Alibaba Bailian/DashScope free-tier quota exhausted (Stop-on-Exhaust).
+	"the free quota has been exhausted",
+	"免费额度已用尽",
+	// Upstream reseller (runs new-api) whose org/owner wallet is drained.
+	"organization and owner combined quota is zero",
+	"insufficient credits",
+	"please top up your balance",
+	// A spent plan/daily allowance rather than a per-second rate limit: it cannot
+	// clear on its own, so every further request is a wasted failover hop. A bare
+	// capacity 429 carries none of these and stays rate-gated.
+	"token plan limit exhausted",
+	"token plan entitlement exhausted",
+	"tokens per day limit exceeded",
+	// A provisioned key that has spent its own daily USD cap: it cannot clear until
+	// the cap resets, so every further request on that lane is a wasted hop.
+	"budget limit exceeded",
+	// Cloudflare Workers AI: the account's daily neuron allowance is spent.
+	"you have used up your daily free allocation",
+	// Resellers whose free tier is a daily counter, not a rate: the first says so,
+	// the second names the reset ("the counter resets at 00:00 UTC").
+	"reached the limit of the free model quota",
+	"free-model daily limit reached",
+	// A reseller running this fork's own daily free-token budget: the message
+	// names today's quota and the daily reset. Read as a bare 429 it only cooled
+	// the lane ten minutes, so six lanes of one reseller failed 3,800 user requests in a day.
+	"free-model token quota",
+	// OpenRouter's daily free-model allowance, both the plain and high-balance
+	// variants ("Rate limit exceeded: free-models-per-day[-high-balance]").
+	"free-models-per-day",
+	// Google free tier: a spent DAILY allowance, not a per-second rate limit, so it
+	// cannot clear on its own and every further request is a wasted failover hop.
+	"you exceeded your current quota",
+	"generate_content_free_tier_requests",
+	// Modal refuses shared-endpoint traffic on plan credits with a 429: an
+	// entitlement the account does not have, so it never clears on its own.
+	"plan credits cannot be applied",
+	// Google returns a suspended/revoked key as 429, which reads as an ordinary
+	// rate limit and keeps the channel in rotation serving nothing.
+	"has been suspended",
+	"consumer 'api_key",
+	// Groq's daily token allowance ("Rate limit reached ... on tokens per day
+	// (TPD)"): spent for the day, so read as a bare 429 it only cooled the lane
+	// and one lane failed 1,700 requests against 840 successes on 2026-09-21.
+	"tokens per day (tpd)",
+	// Inception answers 402 "Free tier limit reached. Please upgrade to a paid
+	// plan": the allowance is gone, nothing about it clears.
+	"free tier limit reached",
+}
+
+func keywordsToString(kw []string) string {
+	return strings.Join(kw, "\n")
+}
+
+func keywordsFromString(s string) []string {
+	out := []string{}
+	for _, k := range strings.Split(s, "\n") {
+		k = strings.ToLower(strings.TrimSpace(k))
+		if k != "" {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+func AutomaticDisableKeywordsToString() string {
+	return keywordsToString(AutomaticDisableKeywords)
+}
+
+func AutomaticDisableKeywordsFromString(s string) {
+	AutomaticDisableKeywords = keywordsFromString(s)
+}
+
+func ChannelFaultKeywordsToString() string {
+	return keywordsToString(ChannelFaultKeywords)
+}
+
+func ChannelFaultKeywordsFromString(s string) {
+	ChannelFaultKeywords = keywordsFromString(s)
+}

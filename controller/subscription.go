@@ -1,0 +1,544 @@
+package controller
+
+import (
+	"math"
+
+	"fmt"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/gin-gonic/gin"
+	"github.com/go-fuego/fuego"
+	"gorm.io/gorm"
+)
+
+// ---- Local types that reference model (cannot live in dto due to import cycle) ----
+
+type SubscriptionPlanDTO struct {
+	Plan model.SubscriptionPlan `json:"plan"`
+	// Derived server-side so every client renders the same numbers instead of
+	// re-implementing the reset-period math: dollars granted per reset, and the
+	// total across the plan's whole duration.
+	QuotaPerResetUsd  float64 `json:"quota_per_reset_usd"`
+	EstimatedTotalUsd float64 `json:"estimated_total_usd"`
+}
+
+// How many quota resets fall inside one full plan duration. Mirrors the
+// gateway's own period lengths (30.44d month, 365.25d year).
+func estimateResetsPerDuration(resetPeriod, durationUnit string, durationValue int) int {
+	var durationSeconds float64
+	switch durationUnit {
+	case "year":
+		durationSeconds = float64(durationValue) * 365.25 * 86400
+	case "month":
+		durationSeconds = float64(durationValue) * 30.44 * 86400
+	case "day":
+		durationSeconds = float64(durationValue) * 86400
+	case "hour":
+		durationSeconds = float64(durationValue) * 3600
+	default:
+		return 1
+	}
+
+	var resetSeconds float64
+	switch resetPeriod {
+	case "daily":
+		resetSeconds = 86400
+	case "weekly":
+		resetSeconds = 7 * 86400
+	case "monthly":
+		resetSeconds = 30.44 * 86400
+	default:
+		return 1
+	}
+
+	if resetSeconds <= 0 || durationSeconds <= 0 {
+		return 0
+	}
+	return int(math.Floor(durationSeconds / resetSeconds))
+}
+
+type AdminUpsertSubscriptionPlanRequest struct {
+	Plan model.SubscriptionPlan `json:"plan"`
+}
+
+type SubscriptionSelfData struct {
+	BillingPreference string                      `json:"billing_preference"`
+	Subscriptions     []model.SubscriptionSummary `json:"subscriptions" validate:"required"`
+	AllSubscriptions  []model.SubscriptionSummary `json:"all_subscriptions" validate:"required"`
+}
+
+type SubscriptionBalancePayRequest struct {
+	PlanId int `json:"plan_id"`
+}
+
+// ---- User APIs ----
+
+func GetSubscriptionPlans(c fuego.ContextNoBody) (*dto.Response[[]SubscriptionPlanDTO], error) {
+	if !operation_setting.IsPaymentComplianceConfirmed() {
+		return dto.Ok([]SubscriptionPlanDTO{})
+	}
+	var plans []model.SubscriptionPlan
+	// Price ascending before id: operators leave sort_order at 0, so id order
+	// would present the tiers in whatever sequence they were created rather than
+	// cheapest first, which is the order the pricing page reads top to bottom.
+	if err := model.DB.Where("enabled = ?", true).Order("sort_order desc, price_amount asc, id desc").Find(&plans).Error; err != nil {
+		return dto.Fail[[]SubscriptionPlanDTO](err.Error())
+	}
+	result := make([]SubscriptionPlanDTO, 0, len(plans))
+	for _, p := range plans {
+		p.NormalizeDefaults()
+		quotaPerResetUsd := float64(p.TotalAmount) / common.QuotaPerUnit
+		resets := estimateResetsPerDuration(p.QuotaResetPeriod, p.DurationUnit, p.DurationValue)
+		result = append(result, SubscriptionPlanDTO{
+			Plan:              p,
+			QuotaPerResetUsd:  quotaPerResetUsd,
+			EstimatedTotalUsd: math.Round(quotaPerResetUsd*float64(resets)*100) / 100,
+		})
+	}
+	return dto.Ok(result)
+}
+
+func GetSubscriptionSelf(c fuego.ContextNoBody) (*dto.Response[SubscriptionSelfData], error) {
+	userId := dto.UserID(c)
+	settingMap, _ := model.GetUserSetting(userId, false)
+	pref := common.NormalizeBillingPreference(settingMap.BillingPreference)
+
+	// Get all subscriptions (including expired)
+	allSubscriptions, err := model.GetAllUserSubscriptions(userId)
+	if err != nil {
+		allSubscriptions = []model.SubscriptionSummary{}
+	}
+
+	// Get active subscriptions for backward compatibility
+	activeSubscriptions, err := model.GetAllActiveUserSubscriptions(userId)
+	if err != nil {
+		activeSubscriptions = []model.SubscriptionSummary{}
+	}
+
+	return dto.Ok(SubscriptionSelfData{
+		BillingPreference: pref,
+		Subscriptions:     activeSubscriptions, // all active subscriptions
+		AllSubscriptions:  allSubscriptions,    // all subscriptions including expired
+	})
+}
+
+func UpdateSubscriptionPreference(c fuego.ContextWithBody[dto.BillingPreferenceRequest]) (*dto.Response[dto.BillingPreferenceData], error) {
+	userId := dto.UserID(c)
+	req, err := c.Body()
+	if err != nil {
+		return dto.Fail[dto.BillingPreferenceData]("Invalid parameters")
+	}
+	pref := common.NormalizeBillingPreference(req.BillingPreference)
+
+	user, err := model.GetUserById(userId, true)
+	if err != nil {
+		return dto.Fail[dto.BillingPreferenceData](err.Error())
+	}
+	current := user.GetSetting()
+	current.BillingPreference = pref
+	if err := model.UpdateUserSetting(user.Id, current); err != nil {
+		return dto.Fail[dto.BillingPreferenceData](err.Error())
+	}
+	return dto.Ok(dto.BillingPreferenceData{BillingPreference: pref})
+}
+
+func SubscriptionRequestBalancePay(c fuego.ContextWithBody[SubscriptionBalancePayRequest]) (dto.MessageResponse, error) {
+	ginCtx := dto.GinCtx(c)
+	if !requirePaymentCompliance(ginCtx) {
+		return dto.FailMsg("Payment, redemption, subscription, and invitation reward features are disabled. The administrator must confirm compliance terms before enabling them.")
+	}
+
+	userId := ginCtx.GetInt("id")
+	req, err := c.Body()
+	if err != nil || req.PlanId <= 0 {
+		return dto.FailMsg("Invalid parameters")
+	}
+
+	if held, err := model.HasActiveUserSubscriptionForPlan(userId, req.PlanId); err != nil {
+		return dto.FailMsg(err.Error())
+	} else if held {
+		return dto.FailMsg("You already hold this plan and it is still active. A plan can be held once at a time; you can add a different plan next to it.")
+	}
+	if err := model.PurchaseSubscriptionWithBalance(userId, req.PlanId); err != nil {
+		return dto.FailMsg(err.Error())
+	}
+	return dto.Msg("")
+}
+
+// ---- Admin APIs ----
+
+func AdminListSubscriptionPlans(c fuego.ContextNoBody) (*dto.Response[[]SubscriptionPlanDTO], error) {
+	var plans []model.SubscriptionPlan
+	if err := model.DB.Order("sort_order desc, id desc").Find(&plans).Error; err != nil {
+		return dto.Fail[[]SubscriptionPlanDTO](err.Error())
+	}
+	result := make([]SubscriptionPlanDTO, 0, len(plans))
+	for _, p := range plans {
+		p.NormalizeDefaults()
+		result = append(result, SubscriptionPlanDTO{
+			Plan: p,
+		})
+	}
+	return dto.Ok(result)
+}
+
+func AdminCreateSubscriptionPlan(c fuego.ContextWithBody[AdminUpsertSubscriptionPlanRequest]) (*dto.Response[model.SubscriptionPlan], error) {
+	if !operation_setting.IsPaymentComplianceConfirmed() {
+		return dto.Fail[model.SubscriptionPlan]("Payment, redemption, subscription, and invitation reward features are disabled. The administrator must confirm compliance terms before enabling them.")
+	}
+	req, err := c.Body()
+	if err != nil {
+		return dto.Fail[model.SubscriptionPlan]("Invalid parameters")
+	}
+	req.Plan.Id = 0
+	if strings.TrimSpace(req.Plan.Title) == "" {
+		return dto.Fail[model.SubscriptionPlan]("Subscription plan title cannot be empty")
+	}
+	if req.Plan.PriceAmount < 0 {
+		return dto.Fail[model.SubscriptionPlan]("Price cannot be negative")
+	}
+	if req.Plan.PriceAmount > 9999 {
+		return dto.Fail[model.SubscriptionPlan]("Price cannot exceed 9999")
+	}
+	if req.Plan.Currency == "" {
+		req.Plan.Currency = "USD"
+	}
+	req.Plan.Currency = "USD"
+	if req.Plan.AllowBalancePay == nil {
+		req.Plan.AllowBalancePay = common.GetPointer(true)
+	}
+	if req.Plan.AllowWalletOverflow == nil {
+		req.Plan.AllowWalletOverflow = common.GetPointer(true)
+	}
+	if req.Plan.DurationUnit == "" {
+		req.Plan.DurationUnit = model.SubscriptionDurationMonth
+	}
+	if req.Plan.DurationValue <= 0 && req.Plan.DurationUnit != model.SubscriptionDurationCustom {
+		req.Plan.DurationValue = 1
+	}
+	if req.Plan.MaxPurchasePerUser < 0 {
+		return dto.Fail[model.SubscriptionPlan]("Purchase limit cannot be negative")
+	}
+	if req.Plan.TotalAmount < 0 {
+		return dto.Fail[model.SubscriptionPlan]("Total quota cannot be negative")
+	}
+	req.Plan.UpgradeGroup = strings.TrimSpace(req.Plan.UpgradeGroup)
+	if req.Plan.UpgradeGroup != "" {
+		if _, ok := ratio_setting.GetGroupRatioCopy()[req.Plan.UpgradeGroup]; !ok {
+			return dto.Fail[model.SubscriptionPlan]("Upgrade group does not exist")
+		}
+	}
+	req.Plan.DowngradeGroup = strings.TrimSpace(req.Plan.DowngradeGroup)
+	if req.Plan.DowngradeGroup != "" {
+		if _, ok := ratio_setting.GetGroupRatioCopy()[req.Plan.DowngradeGroup]; !ok {
+			return dto.Fail[model.SubscriptionPlan]("Upgrade group does not exist")
+		}
+	}
+	req.Plan.QuotaResetPeriod = model.NormalizeResetPeriod(req.Plan.QuotaResetPeriod)
+	if req.Plan.QuotaResetPeriod == model.SubscriptionResetCustom && req.Plan.QuotaResetCustomSeconds <= 0 {
+		return dto.Fail[model.SubscriptionPlan]("Custom reset cycle must be greater than 0 seconds")
+	}
+	if err := model.DB.Create(&req.Plan).Error; err != nil {
+		return dto.Fail[model.SubscriptionPlan](err.Error())
+	}
+	model.InvalidateSubscriptionPlanCache(req.Plan.Id)
+	return dto.Ok(req.Plan)
+}
+
+func AdminUpdateSubscriptionPlan(c fuego.ContextWithBody[AdminUpsertSubscriptionPlanRequest]) (dto.MessageResponse, error) {
+	if !operation_setting.IsPaymentComplianceConfirmed() {
+		return dto.FailMsg("Payment, redemption, subscription, and invitation reward features are disabled. The administrator must confirm compliance terms before enabling them.")
+	}
+	id, err := c.PathParamIntErr("id")
+	if err != nil || id <= 0 {
+		return dto.FailMsg("Invalid ID")
+	}
+	req, err := c.Body()
+	if err != nil {
+		return dto.FailMsg("Invalid parameters")
+	}
+	if strings.TrimSpace(req.Plan.Title) == "" {
+		return dto.FailMsg("Subscription plan title cannot be empty")
+	}
+	if req.Plan.PriceAmount < 0 {
+		return dto.FailMsg("Price cannot be negative")
+	}
+	if req.Plan.PriceAmount > 9999 {
+		return dto.FailMsg("Price cannot exceed 9999")
+	}
+	req.Plan.Id = id
+	if req.Plan.Currency == "" {
+		req.Plan.Currency = "USD"
+	}
+	req.Plan.Currency = "USD"
+	if req.Plan.DurationUnit == "" {
+		req.Plan.DurationUnit = model.SubscriptionDurationMonth
+	}
+	if req.Plan.DurationValue <= 0 && req.Plan.DurationUnit != model.SubscriptionDurationCustom {
+		req.Plan.DurationValue = 1
+	}
+	if req.Plan.MaxPurchasePerUser < 0 {
+		return dto.FailMsg("Purchase limit cannot be negative")
+	}
+	if req.Plan.TotalAmount < 0 {
+		return dto.FailMsg("Total quota cannot be negative")
+	}
+	req.Plan.UpgradeGroup = strings.TrimSpace(req.Plan.UpgradeGroup)
+	if req.Plan.UpgradeGroup != "" {
+		if _, ok := ratio_setting.GetGroupRatioCopy()[req.Plan.UpgradeGroup]; !ok {
+			return dto.FailMsg("Upgrade group does not exist")
+		}
+	}
+	req.Plan.DowngradeGroup = strings.TrimSpace(req.Plan.DowngradeGroup)
+	if req.Plan.DowngradeGroup != "" {
+		if _, ok := ratio_setting.GetGroupRatioCopy()[req.Plan.DowngradeGroup]; !ok {
+			return dto.FailMsg("Upgrade group does not exist")
+		}
+	}
+	req.Plan.QuotaResetPeriod = model.NormalizeResetPeriod(req.Plan.QuotaResetPeriod)
+	if req.Plan.QuotaResetPeriod == model.SubscriptionResetCustom && req.Plan.QuotaResetCustomSeconds <= 0 {
+		return dto.FailMsg("Custom reset cycle must be greater than 0 seconds")
+	}
+
+	txErr := model.DB.Transaction(func(tx *gorm.DB) error {
+		// update plan (allow zero values updates with map)
+		updateMap := map[string]any{
+			"title":                      req.Plan.Title,
+			"subtitle":                   req.Plan.Subtitle,
+			"price_amount":               req.Plan.PriceAmount,
+			"currency":                   req.Plan.Currency,
+			"duration_unit":              req.Plan.DurationUnit,
+			"duration_value":             req.Plan.DurationValue,
+			"custom_seconds":             req.Plan.CustomSeconds,
+			"enabled":                    req.Plan.Enabled,
+			"sort_order":                 req.Plan.SortOrder,
+			"stripe_price_id":            req.Plan.StripePriceId,
+			"creem_product_id":           req.Plan.CreemProductId,
+			"waffo_pancake_product_id":   req.Plan.WaffoPancakeProductId,
+			"max_purchase_per_user":      req.Plan.MaxPurchasePerUser,
+			"total_amount":               req.Plan.TotalAmount,
+			"upgrade_group":              req.Plan.UpgradeGroup,
+			"downgrade_group":            req.Plan.DowngradeGroup,
+			"quota_reset_period":         req.Plan.QuotaResetPeriod,
+			"quota_reset_custom_seconds": req.Plan.QuotaResetCustomSeconds,
+			"updated_at":                 common.GetTimestamp(),
+		}
+		if req.Plan.AllowBalancePay != nil {
+			updateMap["allow_balance_pay"] = *req.Plan.AllowBalancePay
+		}
+		if req.Plan.AllowWalletOverflow != nil {
+			updateMap["allow_wallet_overflow"] = *req.Plan.AllowWalletOverflow
+		}
+		if err := tx.Model(&model.SubscriptionPlan{}).Where("id = ?", id).Updates(updateMap).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+	if txErr != nil {
+		return dto.FailMsg(txErr.Error())
+	}
+	model.InvalidateSubscriptionPlanCache(id)
+	return dto.Msg("")
+}
+
+func AdminUpdateSubscriptionPlanStatus(c fuego.ContextWithBody[dto.AdminUpdateSubscriptionPlanStatusRequest]) (dto.MessageResponse, error) {
+	if !operation_setting.IsPaymentComplianceConfirmed() {
+		return dto.FailMsg("Payment, redemption, subscription, and invitation reward features are disabled. The administrator must confirm compliance terms before enabling them.")
+	}
+	id, err := c.PathParamIntErr("id")
+	if err != nil || id <= 0 {
+		return dto.FailMsg("Invalid ID")
+	}
+	req, err := c.Body()
+	if err != nil || req.Enabled == nil {
+		return dto.FailMsg("Invalid parameters")
+	}
+	if err := model.DB.Model(&model.SubscriptionPlan{}).Where("id = ?", id).Update("enabled", *req.Enabled).Error; err != nil {
+		return dto.FailMsg(err.Error())
+	}
+	model.InvalidateSubscriptionPlanCache(id)
+	return dto.Msg("")
+}
+
+func AdminBindSubscription(c fuego.ContextWithBody[dto.AdminBindSubscriptionRequest]) (dto.MessageResponse, error) {
+	if !operation_setting.IsPaymentComplianceConfirmed() {
+		return dto.FailMsg("Payment, redemption, subscription, and invitation reward features are disabled. The administrator must confirm compliance terms before enabling them.")
+	}
+	req, err := c.Body()
+	if err != nil || req.UserId <= 0 || req.PlanId <= 0 {
+		return dto.FailMsg("Invalid parameters")
+	}
+	msg, err := model.AdminBindSubscription(req.UserId, req.PlanId, "")
+	if err != nil {
+		return dto.FailMsg(err.Error())
+	}
+	return dto.Msg(subscriptionNotice(msg))
+}
+
+// subscriptionNotice tells the admin how the user's group changes, when it does.
+func subscriptionNotice(notice *common.Message) string {
+	if notice == nil {
+		return ""
+	}
+	return notice.Error()
+}
+
+// ---- Admin: user subscription management ----
+
+func AdminListUserSubscriptions(c fuego.ContextNoBody) (*dto.Response[[]model.SubscriptionSummary], error) {
+	userId, err := c.PathParamIntErr("id")
+	if err != nil || userId <= 0 {
+		return dto.Fail[[]model.SubscriptionSummary]("Invalid user ID")
+	}
+	subs, err := model.GetAllUserSubscriptions(userId)
+	if err != nil {
+		return dto.Fail[[]model.SubscriptionSummary](err.Error())
+	}
+	return dto.Ok(subs)
+}
+
+type AdminResetSubscriptionRequest struct {
+	PlanId           int   `json:"plan_id"`
+	AdvanceResetTime *bool `json:"advance_reset_time"`
+}
+
+func resolveAdvanceResetTime(value *bool) bool {
+	if value == nil {
+		return true
+	}
+	return *value
+}
+
+func recordSubscriptionResetUserLogs(c *gin.Context, result *model.SubscriptionResetResult, adminInfo *model.AuditAdminInfo) {
+	if result == nil || result.ResetCount == 0 {
+		return
+	}
+	const action = "subscription.user_quota_reset"
+	params := map[string]any{"plan_id": result.PlanId, "plan_title": result.PlanTitle}
+	operation := model.AuditOperation{Action: action, Params: params}
+	content := auditContentEN(action, params)
+	for _, userId := range result.AffectedUserIds {
+		model.RecordLogWithAdminInfo(userId, model.LogTypeManage, content, adminInfo, &operation, c)
+	}
+}
+
+// AdminCreateUserSubscription creates a new user subscription from a plan (no payment).
+func AdminCreateUserSubscription(c fuego.ContextWithBody[dto.AdminCreateUserSubscriptionRequest]) (*dto.Response[dto.SubscriptionActionData], error) {
+	if !operation_setting.IsPaymentComplianceConfirmed() {
+		return dto.Fail[dto.SubscriptionActionData]("Payment, redemption, subscription, and invitation reward features are disabled. The administrator must confirm compliance terms before enabling them.")
+	}
+	userId, err := c.PathParamIntErr("id")
+	if err != nil || userId <= 0 {
+		return dto.Fail[dto.SubscriptionActionData]("Invalid user ID")
+	}
+	req, err := c.Body()
+	if err != nil || req.PlanId <= 0 {
+		return dto.Fail[dto.SubscriptionActionData]("Invalid parameters")
+	}
+	msg, err := model.AdminBindSubscription(userId, req.PlanId, "")
+	if err != nil {
+		return dto.Fail[dto.SubscriptionActionData](err.Error())
+	}
+	return dto.Ok(dto.SubscriptionActionData{Message: subscriptionNotice(msg)})
+}
+
+// AdminResetUserSubscriptionsByPlan resets a user's subscriptions for a plan (admin).
+func AdminResetUserSubscriptionsByPlan(c fuego.ContextWithBody[AdminResetSubscriptionRequest]) (*dto.Response[*model.SubscriptionResetResult], error) {
+	ginCtx := dto.GinCtx(c)
+	userId, err := c.PathParamIntErr("id")
+	if err != nil || userId <= 0 {
+		return dto.Fail[*model.SubscriptionResetResult]("Invalid user ID")
+	}
+	req, err := c.Body()
+	if err != nil || req.PlanId <= 0 {
+		return dto.Fail[*model.SubscriptionResetResult]("Invalid parameters")
+	}
+	advanceResetTime := resolveAdvanceResetTime(req.AdvanceResetTime)
+	result, err := model.AdminResetUserSubscriptionsByPlan(userId, req.PlanId, advanceResetTime)
+	if err != nil {
+		return dto.Fail[*model.SubscriptionResetResult](err.Error())
+	}
+	recordSubscriptionResetUserLogs(ginCtx, result, auditOperatorInfo(ginCtx))
+	recordManageAuditFor(ginCtx, userId, "subscription.user_plan_reset", map[string]any{
+		"target_user_id":     userId,
+		"plan_id":            result.PlanId,
+		"plan_title":         result.PlanTitle,
+		"reset_count":        result.ResetCount,
+		"user_count":         result.UserCount,
+		"advance_reset_time": result.AdvanceResetTime,
+	})
+	return dto.Ok(result)
+}
+
+// AdminResetPlanSubscriptions resets all subscriptions of a plan (admin).
+func AdminResetPlanSubscriptions(c fuego.ContextWithBody[AdminResetSubscriptionRequest]) (*dto.Response[*model.SubscriptionResetResult], error) {
+	ginCtx := dto.GinCtx(c)
+	planId, err := c.PathParamIntErr("id")
+	if err != nil || planId <= 0 {
+		return dto.Fail[*model.SubscriptionResetResult]("Invalid parameters")
+	}
+	req, err := c.Body()
+	if err != nil {
+		return dto.Fail[*model.SubscriptionResetResult]("Invalid parameters")
+	}
+	advanceResetTime := resolveAdvanceResetTime(req.AdvanceResetTime)
+	result, err := model.AdminResetPlanSubscriptions(planId, advanceResetTime)
+	if err != nil {
+		return dto.Fail[*model.SubscriptionResetResult](err.Error())
+	}
+	recordSubscriptionResetUserLogs(ginCtx, result, auditOperatorInfo(ginCtx))
+	common.SysLog(fmt.Sprintf("admin reset subscription plan %d quota: reset_count=%d user_count=%d advance_reset_time=%t",
+		result.PlanId, result.ResetCount, result.UserCount, result.AdvanceResetTime))
+	recordManageAudit(ginCtx, "subscription.plan_reset", map[string]any{
+		"plan_id":            result.PlanId,
+		"plan_title":         result.PlanTitle,
+		"reset_count":        result.ResetCount,
+		"user_count":         result.UserCount,
+		"advance_reset_time": result.AdvanceResetTime,
+	})
+	return dto.Ok(result)
+}
+
+// AdminInvalidateUserSubscription cancels a user subscription immediately.
+func AdminInvalidateUserSubscription(c fuego.ContextNoBody) (*dto.Response[dto.SubscriptionActionData], error) {
+	subId, err := c.PathParamIntErr("id")
+	if err != nil || subId <= 0 {
+		return dto.Fail[dto.SubscriptionActionData]("Invalid subscription ID")
+	}
+	msg, err := model.AdminInvalidateUserSubscription(subId)
+	if err != nil {
+		return dto.Fail[dto.SubscriptionActionData](err.Error())
+	}
+	return dto.Ok(dto.SubscriptionActionData{Message: subscriptionNotice(msg)})
+}
+
+// GetUserSubscriptionOrders returns the caller's subscription payment history.
+func GetUserSubscriptionOrders(c fuego.ContextNoBody) (*dto.Response[dto.PageData[*model.SubscriptionOrder]], error) {
+	userId := dto.UserID(c)
+	pageInfo := dto.PageInfo(c)
+
+	orders, total, err := model.GetUserSubscriptionOrders(userId, pageInfo)
+	if err != nil {
+		return dto.FailPage[*model.SubscriptionOrder](err.Error())
+	}
+
+	return dto.OkPage(pageInfo, orders, int(total))
+}
+
+// AdminDeleteUserSubscription hard-deletes a user subscription.
+func AdminDeleteUserSubscription(c fuego.ContextNoBody) (*dto.Response[dto.SubscriptionActionData], error) {
+	subId, err := c.PathParamIntErr("id")
+	if err != nil || subId <= 0 {
+		return dto.Fail[dto.SubscriptionActionData]("Invalid subscription ID")
+	}
+	msg, err := model.AdminDeleteUserSubscription(subId)
+	if err != nil {
+		return dto.Fail[dto.SubscriptionActionData](err.Error())
+	}
+	return dto.Ok(dto.SubscriptionActionData{Message: subscriptionNotice(msg)})
+}

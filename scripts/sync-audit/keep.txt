@@ -1,0 +1,111 @@
+# <file> :: <literal that must still be there>
+# Prod-only blocks an upstream merge has silently dropped before, with no conflict.
+relaykit/dto/channel_settings.go :: ChannelCapabilities
+relaykit/dto/channel_settings.go :: AdvancedCustomConverter
+relaykit/dto/pricing.go :: ContextLength
+constant/channel_prod.go :: ChannelTypeAIHorde  = 1001
+constant/channel_prod.go :: ChannelTypeRunware  = 1002
+# TypeSafe Jev decisions relay, ported from upstream PRs 7443 and 7462 while they are unmerged
+constant/channel_prod.go :: ChannelTypeTypeSafe = 1003
+router/relay-router.go :: types.RelayFormatDecisions
+controller/relay.go :: relay.DecisionsHelper
+controller/relay.go :: relayconstant.RelayModeDecisions:
+relay/decisions_handler.go :: func DecisionsHelper
+relay/helper/valid_request.go :: types.RelayFormatDecisions
+relay/common/relay_info.go :: types.RelayFormatDecisions
+relay/common/request_shape.go :: "questions"
+relaykit/dto/channel_settings.go :: DecisionsUpstreamPath
+common/constants.go :: ThemeAwarePath
+common/str.go :: "regexp"
+model/user_cache.go :: GetUserById(userId, false)
+model/channel_cache.go :: newGroup2model2channels[group] == nil
+model/option.go :: func ReloadPricingOptionsOnMiss
+router/authz-router.go :: ModAuth
+router/api-router.go :: modReadGroup
+router/api-router.go :: logGroup.Group("", middleware.ModAuth())
+middleware/auth.go :: IsTrustedNetwork
+middleware/bff_resolve.go :: IsTrustedNetwork
+middleware/distributor.go :: tokenModelAllowed
+go.mod :: replace github.com/QuantumNous/new-api/relaykit => ./relaykit
+go.mod :: github.com/gin-contrib/sessions v0.0.5
+web/src/features/usage-logs/components/usage-logs-provider.tsx :: role < ROLE.MOD
+service/pre_consume_quota.go :: requestChargesQuota(
+service/billing_session.go :: requestChargesQuota(
+controller/channel-test.go :: func pickAutoTestModel
+controller/channel-test.go :: pickAutoTestModel(channel)
+controller/channel-test.go :: AutoTestDisabledChannelsOnly
+controller/channel-test.go :: "-i2v"
+main.go :: controller.AutomaticallySnapshotModelStatus()
+service/auth_token.go :: 30 * 24 * time.Hour
+dto/user.go :: max=72
+relay/channel/claude/relay-claude.go :: ResponsesStreamState
+controller/channel_authz.go :: channelSensitiveFields
+model/ability.go :: sort.Strings(models)
+constant/channel.go :: ProdChannelBaseURLs[channelType]
+web/src/features/channels/components/drawers/channel-mutate-drawer.tsx :: maxLength={1024}
+# the mod role in the audit log: recorded as itself, readable by mods and admins
+service/authz/role_prod.go :: const BuiltInRoleMod = "mod"
+model/audit_log.go :: case common.RoleCommonUser, common.RoleModUser, common.RoleAdminUser, common.RoleRootUser:
+model/audit_log.go :: []int{common.RoleCommonUser, common.RoleModUser, common.RoleAdminUser}
+model/audit_log.go :: !filter.SelfView && viewerRole >= common.RoleModUser
+router/api-router.go :: middleware.ModAuth(), middleware.RequirePermission(authz.AuditRead)
+web/src/features/usage-logs/audit/index.tsx :: user.role >= ROLE.MOD &&
+relaykit/dto/openai_response.go :: Part         any
+setting/model_setting/gemini.go :: DefaultReasoningEffort:                "low",
+relay/common/relay_info.go :: DefaultReasoningEffort:                geminiSettings.DefaultReasoningEffort,
+relaykit/relayconvert/internal/shared/gemini/request.go :: opts.Gemini.DefaultReasoningEffort != "" &&
+relaykit/relayconvert/reasoning/intent.go :: SourceDefault  Source = "default"
+service/host_stall.go :: func HostStallingFor(userId int, host string) bool
+controller/relay.go :: service.RecordHostStall(service.UpstreamHostOf(stalled.GetBaseURL()), channelError.ChannelId)
+controller/relay.go :: service.HostStallingFor(c.GetInt("id"), host)
+middleware/distributor.go :: !service.HostStallingFor(c.GetInt("id"), service.UpstreamHostOf(preferred.GetBaseURL()))
+setting/operation_setting/monitor_setting.go :: ProviderStallUserIds       []int `json:"provider_stall_user_ids"`
+model/pricing.go :: model_setting.IsCatalogHiddenModel(model)
+setting/model_setting/global.go :: func IsCatalogHiddenModel(name string) bool
+controller/relay.go :: only serves POST /v1/decisions
+relay/channel/gemini/relay-gemini.go :: the provider ended this reply before it finished
+service/paid_probe.go :: func TrackPaidProbe(userId int, modelName string)
+controller/relay.go :: service.TrackPaidProbe(relayInfo.UserId, relayInfo.OriginModelName)
+setting/operation_setting/quota_setting.go :: PaidProbeMaxDistinctModels int
+setting/operation_setting/quota_setting.go :: PaidProbeMaxRefusals
+service/network_reputation.go :: func accountEmailDomain(username, email string, allow map[string]struct{}) string
+setting/operation_setting/quota_setting.go :: FreeAbuseEmailDomainDailyMin int
+middleware/turnstile-check.go :: func TurnstileCheckAnonymous() gin.HandlerFunc
+router/api-router.go :: middleware.TurnstileCheckAnonymous()
+# the BFF issues legacy access tokens; upstream retires them 30 days after first start
+model/user_access_token.go :: The BFF still issues legacy tokens
+controller/relay.go :: newAPIError.StatusCode == http.StatusBadGateway
+service/upstream_class.go :: "database error:", "undefinedcolumn"
+# moderators (role 5) read the admin pages: every read a mod page fires on mount stays ModAuth,
+# and a mod page never calls an AdminAuth route (2026-10-13: usage logs fetched the admin plan list)
+router/api-router.go :: apiRouter.GET("/data/users", middleware.ModAuth()
+router/api-router.go :: apiRouter.Group("/channel", middleware.ModAuth())
+router/api-router.go :: apiRouter.Group("/data", middleware.ModAuth())
+router/api-router.go :: apiRouter.Group("/group", middleware.ModAuth())
+router/api-router.go :: taskGroup.Group("", middleware.ModAuth())
+web/src/features/usage-logs/components/usage-logs-table.tsx :: userRole >= ROLE.ADMIN ? await getAdminPlans() : await getPublicPlans()
+router/api-router.go :: logGroup.Group("", middleware.ModAuth(), middleware.NoPAT())
+# a reseller must not show which provider answered: every host and domain in a client error is masked
+relaykit/relayconvert/kitutil/mask.go :: if !MaskEveryHost &&
+common/str.go :: kitutil.MaskEveryHost = true
+# a key's default reasoning level fills requests that send none (key settings selector)
+model/token.go :: DefaultReasoningEffort string `json:"default_reasoning_effort"
+relay/helper/token_reasoning.go :: func ApplyTokenReasoningDefault
+controller/relay.go :: helper.ApplyTokenReasoningDefault(c, request)
+middleware/auth.go :: constant.ContextKeyTokenReasoningEffort
+model/channel_shard_filter_prod.go :: func SharedFilterSiblingIDs
+controller/relay.go :: model.SharedFilterSiblingIDs(channel.Id)
+service/upstream_class.go :: "Account quota is insufficient"
+# a key's prompt cache mode marks or busts provider prefix caches (key settings selector)
+model/token.go :: PromptCache string `json:"prompt_cache"
+relay/helper/token_prompt_cache.go :: func ApplyTokenPromptCache
+controller/relay.go :: helper.ApplyTokenPromptCache(c, request)
+middleware/auth.go :: constant.ContextKeyTokenPromptCache
+# low balance reminders stay opt-in with one mail per drop; upstream's are on until a user opts out
+service/quota.go :: !common.QuotaRemindEnabled || !userSetting.QuotaWarningEnabled
+service/quota.go :: acquireQuotaWarnLatch(relayInfo.UserId)
+types/user_settings.go :: QuotaWarningEnabled              bool
+# notification settings start from the stored settings, so consent and reward flags survive a save
+controller/user.go :: settings := user.GetSetting()
+# the prod channel notification switch still gates channel notices
+service/channel.go :: operation_setting.GetMonitorSetting().ChannelStatusNotifyEnabled
