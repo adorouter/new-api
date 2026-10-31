@@ -49,7 +49,7 @@ func adoRelayPathAllowed(path string) bool {
 func abortAdoClosedRelayPath(c *gin.Context) {
 	c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
 		"error": gin.H{
-			"message": "this endpoint isn't available: adorouter currently serves text models only",
+			"message": "this endpoint isn't available: AdoRouter currently serves text models only",
 			"type":    "invalid_request_error",
 			"code":    "ENDPOINT_NOT_AVAILABLE",
 		},

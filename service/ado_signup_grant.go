@@ -82,7 +82,7 @@ func adoAlertSignupGrantCap(limit int) {
 	if now-last < adoAlertCooldownSeconds || !adoLastCapAlertUnix.CompareAndSwap(last, now) {
 		return
 	}
-	message := fmt.Sprintf("adorouter: signup credit paused, %d grants paid in the last 24 hours. New accounts get no credit until it drops. This may be abuse, or you may want to raise ADO_SIGNUP_GRANT_DAILY_LIMIT.", limit)
+	message := fmt.Sprintf("AdoRouter: signup credit paused, %d grants paid in the last 24 hours. New accounts get no credit until it drops. This may be abuse, or you may want to raise ADO_SIGNUP_GRANT_DAILY_LIMIT.", limit)
 	common.SysError(message)
 	webhook := strings.TrimSpace(os.Getenv("ADO_ALERT_WEBHOOK_URL"))
 	if webhook == "" {
