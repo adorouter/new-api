@@ -1,0 +1,221 @@
+package cloudflare
+
+import (
+	"bufio"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/logger"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/samber/lo"
+
+	"github.com/gin-gonic/gin"
+)
+
+func convertCf2CompletionsRequest(textRequest dto.GeneralOpenAIRequest) *CfRequest {
+	p, _ := textRequest.Prompt.(string)
+	return &CfRequest{
+		Prompt:      p,
+		MaxTokens:   textRequest.GetMaxTokens(),
+		Stream:      lo.FromPtrOr(textRequest.Stream, false),
+		Temperature: textRequest.Temperature,
+	}
+}
+
+func cfStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*types.NewAPIError, *dto.Usage) {
+	scanner := helper.NewStreamScanner(resp.Body)
+	scanner.Split(bufio.ScanLines)
+
+	helper.SetEventStreamHeaders(c)
+	id := helper.GetResponseID(c)
+	var responseText string
+	isFirst := true
+
+	for scanner.Scan() {
+		data := scanner.Text()
+		if len(data) < len("data: ") {
+			continue
+		}
+		data = strings.TrimPrefix(data, "data: ")
+		data = strings.TrimSuffix(data, "\r")
+
+		if data == "[DONE]" {
+			break
+		}
+
+		var response dto.ChatCompletionsStreamResponse
+		err := json.Unmarshal([]byte(data), &response)
+		if err != nil {
+			logger.LogError(c, common.LogText("error_unmarshalling_stream_response: %s", err.Error()))
+			continue
+		}
+		for _, choice := range response.Choices {
+			choice.Delta.Role = "assistant"
+			responseText += choice.Delta.GetContentString()
+		}
+		response.Id = id
+		response.Model = info.UpstreamModelName
+		err = helper.ObjectData(c, response)
+		if isFirst {
+			isFirst = false
+			info.FirstResponseTime = time.Now()
+		}
+		if err != nil {
+			logger.LogError(c, common.LogText("error_rendering_stream_response: %s", err.Error()))
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		logger.LogError(c, common.LogText("error_scanning_stream_response: %s", err.Error()))
+	}
+	usage := service.ResponseText2Usage(c, responseText, info.UpstreamModelName, info.GetEstimatePromptTokens())
+	if info.ShouldIncludeUsage {
+		response := helper.GenerateFinalUsageResponse(id, info.StartTime.Unix(), info.UpstreamModelName, *usage)
+		err := helper.ObjectData(c, response)
+		if err != nil {
+			logger.LogError(c, common.LogText("error_rendering_final_usage_response: %s", err.Error()))
+		}
+	}
+	helper.Done(c)
+
+	service.CloseResponseBodyGracefully(resp)
+
+	return nil, usage
+}
+
+func cfHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*types.NewAPIError, *dto.Usage) {
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
+	}
+	service.CloseResponseBodyGracefully(resp)
+	var response dto.TextResponse
+	err = json.Unmarshal(responseBody, &response)
+	if err != nil {
+		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
+	}
+	response.Model = info.UpstreamModelName
+	var responseText string
+	for _, choice := range response.Choices {
+		responseText += choice.Message.StringContent()
+	}
+	usage := service.ResponseText2Usage(c, responseText, info.UpstreamModelName, info.GetEstimatePromptTokens())
+	response.Usage = *usage
+	response.Id = helper.GetResponseID(c)
+	jsonResponse, err := json.Marshal(response)
+	if err != nil {
+		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
+	}
+	c.Writer.Header().Set("Content-Type", "application/json")
+	c.Writer.WriteHeader(resp.StatusCode)
+	_, _ = c.Writer.Write(jsonResponse)
+	return nil, usage
+}
+
+// cfImageHandler normalizes a Workers AI text-to-image response into the OpenAI
+// image shape. flux returns JSON {result:{image:<b64>}}; classic SD models stream
+// raw image bytes (image/* content-type) which are base64-encoded here.
+func cfImageHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*types.NewAPIError, *dto.Usage) {
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
+	}
+	service.CloseResponseBodyGracefully(resp)
+
+	var b64 string
+	if strings.HasPrefix(resp.Header.Get("Content-Type"), "image/") {
+		b64 = base64.StdEncoding.EncodeToString(responseBody)
+	} else {
+		var cfResp CfImageResponse
+		if err := common.Unmarshal(responseBody, &cfResp); err != nil {
+			return types.NewError(err, types.ErrorCodeBadResponseBody), nil
+		}
+		b64 = cfResp.Result.Image
+	}
+	if b64 == "" {
+		return types.NewError(errors.New("cloudflare returned no image"), types.ErrorCodeBadResponseBody), nil
+	}
+
+	imageResp := dto.ImageResponse{
+		Created: time.Now().Unix(),
+		Data:    []dto.ImageData{{B64Json: b64}},
+	}
+	jsonResponse, err := common.Marshal(imageResp)
+	if err != nil {
+		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
+	}
+	c.Writer.Header().Set("Content-Type", "application/json")
+	c.Writer.WriteHeader(http.StatusOK)
+	_, _ = c.Writer.Write(service.MarkGeneratedMedia(c, jsonResponse))
+
+	usage := &dto.Usage{PromptTokens: info.GetEstimatePromptTokens()}
+	return nil, usage
+}
+
+// cfTTSHandler normalizes a Workers AI text-to-speech response into the OpenAI
+// /v1/audio/speech shape (raw audio bytes). melotts returns JSON {result:{audio:<b64 wav>}};
+// the base64 is decoded and written back as audio/mpeg.
+func cfTTSHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*types.NewAPIError, *dto.Usage) {
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
+	}
+	service.CloseResponseBodyGracefully(resp)
+
+	var cfResp CfTTSResponse
+	if err := common.Unmarshal(responseBody, &cfResp); err != nil {
+		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
+	}
+	if cfResp.Result.Audio == "" {
+		return types.NewError(errors.New("cloudflare returned no audio"), types.ErrorCodeBadResponseBody), nil
+	}
+	audioBytes, err := base64.StdEncoding.DecodeString(cfResp.Result.Audio)
+	if err != nil {
+		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
+	}
+
+	c.Writer.Header().Set("Content-Type", "audio/mpeg")
+	c.Writer.WriteHeader(http.StatusOK)
+	_, _ = c.Writer.Write(audioBytes)
+
+	usage := &dto.Usage{PromptTokens: info.GetEstimatePromptTokens()}
+	return nil, usage
+}
+
+func cfSTTHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*types.NewAPIError, *dto.Usage) {
+	var cfResp CfAudioResponse
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
+	}
+	service.CloseResponseBodyGracefully(resp)
+	err = json.Unmarshal(responseBody, &cfResp)
+	if err != nil {
+		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
+	}
+
+	audioResp := &dto.AudioResponse{
+		Text: cfResp.Result.Text,
+	}
+
+	jsonResponse, err := json.Marshal(audioResp)
+	if err != nil {
+		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
+	}
+	c.Writer.Header().Set("Content-Type", "application/json")
+	c.Writer.WriteHeader(resp.StatusCode)
+	_, _ = c.Writer.Write(jsonResponse)
+
+	usage := service.ResponseText2Usage(c, cfResp.Result.Text, info.UpstreamModelName, info.GetEstimatePromptTokens())
+	return nil, usage
+}

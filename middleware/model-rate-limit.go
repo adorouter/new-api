@@ -1,0 +1,506 @@
+package middleware
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/common/limiter"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
+	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/QuantumNous/new-api/types"
+
+	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
+)
+
+const (
+	ModelRequestRateLimitCountMark        = "MRRL"
+	ModelRequestRateLimitSuccessCountMark = "MRRLS"
+	modelRateLimitTimeFormat              = "2006-01-02T15:04:05.000Z"
+)
+
+// 检查Redis中的请求限制
+// retryAfter is the seconds until the oldest recorded request slides out of the
+// window (the real wait), 0 when allowed or unknown (caller falls back to the
+// full window).
+func checkRedisRateLimit(ctx context.Context, rdb *redis.Client, key string, maxCount int, duration int64) (bool, int64, error) {
+	// 如果maxCount为0，表示不限制
+	if maxCount == 0 {
+		return true, 0, nil
+	}
+
+	// 获取当前计数
+	length, err := rdb.LLen(ctx, key).Result()
+	if err != nil {
+		return false, 0, err
+	}
+
+	// 如果未达到限制，允许请求
+	if length < int64(maxCount) {
+		return true, 0, nil
+	}
+
+	// 检查时间窗口
+	oldTimeStr, _ := rdb.LIndex(ctx, key, -1).Result()
+	oldTime, err := time.Parse(modelRateLimitTimeFormat, oldTimeStr)
+	if err != nil {
+		return false, 0, err
+	}
+
+	nowTimeStr := time.Now().UTC().Format(modelRateLimitTimeFormat)
+	nowTime, err := time.Parse(modelRateLimitTimeFormat, nowTimeStr)
+	if err != nil {
+		return false, 0, err
+	}
+	// 如果在时间窗口内已达到限制，拒绝请求
+	subTime := nowTime.Sub(oldTime).Seconds()
+	if int64(subTime) < duration {
+		rdb.Expire(ctx, key, time.Duration(duration)*time.Second)
+		remaining := duration - int64(subTime)
+		if remaining < 1 {
+			remaining = 1
+		}
+		return false, remaining, nil
+	}
+
+	return true, 0, nil
+}
+
+// 记录Redis请求
+func recordRedisRequest(ctx context.Context, rdb *redis.Client, key string, maxCount int, duration int64) {
+	// 如果maxCount为0，不记录请求
+	if maxCount == 0 {
+		return
+	}
+
+	now := time.Now().UTC().Format(modelRateLimitTimeFormat)
+	rdb.LPush(ctx, key, now)
+	rdb.LTrim(ctx, key, 0, int64(maxCount-1))
+	rdb.Expire(ctx, key, time.Duration(duration)*time.Second)
+}
+
+// Redis限流处理器
+func redisRateLimitHandler(subject string, duration int64, totalMaxCount, successMaxCount int) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ctx := context.Background()
+		rdb := common.RDB
+
+		// 1. 检查成功请求数限制
+		successKey := fmt.Sprintf("rateLimit:%s:%s", ModelRequestRateLimitSuccessCountMark, subject)
+		allowed, retryAfter, err := checkRedisRateLimit(ctx, rdb, successKey, successMaxCount, duration)
+		if err != nil {
+			fmt.Println(common.LogText("failed to check the successful request limit: %s", err.Error()))
+			abortWithOpenAiMessage(c, http.StatusInternalServerError, "rate_limit_check_failed")
+			return
+		}
+		if !allowed {
+			if retryAfter <= 0 {
+				retryAfter = duration
+			}
+			c.Header("Retry-After", strconv.FormatInt(retryAfter, 10))
+			abortWithOpenAiMessage(c, http.StatusTooManyRequests, i18n.T(c, i18n.MsgRateLimitReached, map[string]any{"Minutes": setting.ModelRequestRateLimitDurationMinutes, "Max": successMaxCount}))
+			return
+		}
+
+		//2.检查总请求数限制并记录总请求（当totalMaxCount为0时会自动跳过，使用令牌桶限流器
+		if totalMaxCount > 0 {
+			totalKey := fmt.Sprintf("rateLimit:%s", subject)
+			// 初始化
+			tb := limiter.New(ctx, rdb)
+			allowed, err = tb.Allow(
+				ctx,
+				totalKey,
+				limiter.WithCapacity(rateLimitCapacity(totalMaxCount, duration)),
+				limiter.WithRate(int64(totalMaxCount)),
+				limiter.WithRequested(duration),
+			)
+
+			if err != nil {
+				fmt.Println(common.LogText("failed to check the total request limit: %s", err.Error()))
+				abortWithOpenAiMessage(c, http.StatusInternalServerError, "rate_limit_check_failed")
+				return
+			}
+
+			if !allowed {
+				abortWithOpenAiMessage(c, http.StatusTooManyRequests, i18n.T(c, i18n.MsgRateLimitTotalReached, map[string]any{"Minutes": setting.ModelRequestRateLimitDurationMinutes, "Max": totalMaxCount}))
+				return
+			}
+		}
+
+		// 4. 处理请求
+		c.Next()
+
+		// 5. 如果请求成功，记录成功请求
+		if modelRequestSucceeded(c) {
+			recordRedisRequest(ctx, rdb, successKey, successMaxCount, duration)
+		}
+	}
+}
+
+// 内存限流处理器
+func memoryRateLimitHandler(subject string, duration int64, totalMaxCount, successMaxCount int) gin.HandlerFunc {
+	inMemoryRateLimiter.Init(inMemoryCleanupHorizon)
+
+	return func(c *gin.Context) {
+		totalKey := ModelRequestRateLimitCountMark + subject
+		successKey := ModelRequestRateLimitSuccessCountMark + subject
+
+		// 1. 检查总请求数限制（当totalMaxCount为0时跳过）
+		if totalMaxCount > 0 && !inMemoryRateLimiter.Request(totalKey, totalMaxCount, duration) {
+			abortWithOpenAiMessage(c, http.StatusTooManyRequests, i18n.T(c, i18n.MsgRateLimitTotalReached, map[string]any{"Minutes": setting.ModelRequestRateLimitDurationMinutes, "Max": totalMaxCount}))
+			return
+		}
+
+		var reservation *common.RateLimitReservation
+		if successMaxCount > 0 {
+			reservation = inMemoryRateLimiter.Reserve(successKey, successMaxCount, duration)
+			if reservation == nil {
+				abortWithOpenAiMessage(c, http.StatusTooManyRequests, i18n.T(c, i18n.MsgRateLimitReached, map[string]any{"Minutes": setting.ModelRequestRateLimitDurationMinutes, "Max": successMaxCount}))
+				return
+			}
+			defer reservation.Complete(false)
+		}
+
+		// 3. 处理请求
+		c.Next()
+
+		// 4. 如果请求成功，记录到实际的成功请求计数中
+		reservation.Complete(modelRequestSucceeded(c))
+	}
+}
+
+const (
+	perModelRateLimitKeyMark      = "perModelRateLimitKey"
+	perModelRateLimitMaxMark      = "perModelRateLimitMax"
+	perModelRateLimitDurationMark = "perModelRateLimitDuration"
+	perModelRateLimitMemberMark   = "perModelRateLimitMember"
+	// In-memory cleanup horizon must cover the largest per-model window (Redis
+	// unaffected); entries idle longer than this are evicted.
+	inMemoryCleanupHorizon = 24 * time.Hour
+)
+
+// discountedDuration shortens a rate-limit window by pct percent, never below one
+// second. Out-of-band values are clamped, not rejected: this runs per request, so
+// a bad setting degrades to a sane window instead of failing the call.
+func discountedDuration(duration int64, pct int) int64 {
+	pct = types.ClampFreeRateLimitWindowPct(pct)
+	if pct == 0 || duration <= 0 {
+		return duration
+	}
+	discounted := duration * int64(100-pct) / 100
+	if discounted < 1 {
+		return 1
+	}
+	return discounted
+}
+
+// perModelRateLimit enforces a per-user, per-model success-count cap for the
+// configured `:free` models. Returns false when the request was blocked (already
+// aborted). Paid/small models (not in the map) return true unchanged. On allow it
+// stashes the key/max so the post-handler records the request only on success.
+// FreeModelLimitFor reports the per-account limit the limiter enforces on this
+// model for this user (count per window, window in seconds), so a reply that
+// must read exactly like the limiter's own can quote the same numbers. Models
+// without a rule report the 1 per minute the free tier defaults to.
+func FreeModelLimitFor(c *gin.Context, modelName string) (int, int64) {
+	_, successMaxCount, windowMinutes, found := setting.GetModelRateLimit(modelName)
+	if !found || successMaxCount <= 0 {
+		return 1, 60
+	}
+	if windowMinutes <= 0 {
+		windowMinutes = setting.ModelRequestRateLimitDurationMinutes
+	}
+	duration := int64(windowMinutes * 60)
+	if userSetting, ok := common.GetContextKeyType[types.UserSetting](c, constant.ContextKeyUserSetting); ok {
+		duration = discountedDuration(duration, userSetting.FreeRateLimitWindowPct)
+	}
+	return successMaxCount, duration
+}
+
+func perModelRateLimit(c *gin.Context) bool {
+	if !setting.HasModelRateLimits() {
+		return true
+	}
+	// The ONLY exemption is the explicit per-user UnlimitedFreeModels grant.
+	// No role or balance bypass: infrastructure accounts (guest-token owner,
+	// autotest) get the grant instead, so every exemption is visible in the
+	// user's setting and revocable from the admin drawer.
+	userSetting, hasUserSetting := common.GetContextKeyType[types.UserSetting](c, constant.ContextKeyUserSetting)
+	if hasUserSetting && userSetting.UnlimitedFreeModels {
+		return true
+	}
+	// A full 100% window discount is no wait at all. Handled here rather than in
+	// discountedDuration, which floors at one second and so could never express it.
+	if hasUserSetting &&
+		types.ClampFreeRateLimitWindowPct(userSetting.FreeRateLimitWindowPct) >= types.MaxFreeRateLimitWindowPct {
+		return true
+	}
+	// Read the model exactly as the distributor does: a second reader that matched
+	// keys case-insensitively let {"model":"x:free","Model":"y"} limit y and serve x.
+	var mr ModelRequest
+	path := c.Request.URL.Path
+	switch {
+	case strings.HasPrefix(path, "/v1beta/models/") || strings.HasPrefix(path, "/v1/models/"):
+		mr.Model = extractModelNameFromGeminiPath(path)
+	case strings.HasPrefix(path, "/v1/realtime"):
+		mr.Model = c.Query("model")
+	default:
+		req, err := getModelFromRequest(c)
+		if err != nil {
+			// The distributor refuses the same body, so nothing is served.
+			return true
+		}
+		mr = *req
+		// Same fallback as the distributor: /v1/engines/:model/embeddings may carry the
+		// model only in the path, which left the request with no limit at all.
+		if mr.Model == "" && strings.HasSuffix(path, "embeddings") {
+			mr.Model = c.Param("model")
+		}
+	}
+	if mr.Model == "" {
+		return true
+	}
+	limited, found := setting.ResolveRateLimitedModel(mr.Model)
+	if !found {
+		// Channel lookup strips @key:value modifiers and reasoning suffixes; without the
+		// same fallback here `x:free@temperature:0.7` was served as x:free with no bucket.
+		limited, found = setting.ResolveRateLimitedModel(ratio_setting.RoutingMatchModelName(mr.Model))
+	}
+	if !found {
+		return true
+	}
+	mr.Model = limited
+	_, successMaxCount, windowMinutes, found := setting.GetModelRateLimit(mr.Model)
+	if !found || successMaxCount <= 0 {
+		return true
+	}
+
+	if windowMinutes <= 0 {
+		windowMinutes = setting.ModelRequestRateLimitDurationMinutes
+	}
+	duration := int64(windowMinutes * 60)
+	// Per-user discount (the server-tag perk). Shortens the WAIT rather than
+	// raising the count, because most free models sit at 1 request per window
+	// and a percentage off 1 is still 1.
+	if hasUserSetting {
+		duration = discountedDuration(duration, userSetting.FreeRateLimitWindowPct)
+	}
+	userId := strconv.Itoa(c.GetInt("id"))
+
+	allowed := true
+	// Real remaining wait from the limiter (0 = unknown -> full window fallback).
+	var retryAfter int64
+	// MODELW is a distinct namespace from the retired MODEL list keys: a ZADD
+	// against a leftover list would fail WRONGTYPE.
+	key := fmt.Sprintf("rateLimit:MODELW:%s:%s", userId, mr.Model)
+	member := ""
+	if common.RedisEnabled {
+		// The slot is claimed HERE, not after the upstream answers. A check that
+		// only records on completion leaves the whole upstream latency (17-56s on
+		// free lanes) as a window where every concurrent request sees an empty
+		// bucket, which let one account run 5 "1/min" requests in 8 seconds.
+		member = fmt.Sprintf("%d:%s", time.Now().UnixNano(), common.GetRandomString(8))
+		ctx := context.Background()
+		ok, remaining, err := limiter.New(ctx, common.RDB).
+			Reserve(ctx, key, successMaxCount, time.Duration(duration)*time.Second, member)
+		if err == nil {
+			allowed = ok
+			retryAfter = int64(remaining.Seconds())
+			if !ok && remaining > 0 && retryAfter < 1 {
+				retryAfter = 1
+			}
+		}
+	} else {
+		// Already race-free: Request() checks and records under one mutex.
+		key = fmt.Sprintf("rateLimit:MODEL:%s:%s", userId, mr.Model)
+		inMemoryRateLimiter.Init(inMemoryCleanupHorizon)
+		allowed = inMemoryRateLimiter.Request(key+"_check", successMaxCount, duration)
+	}
+
+	if !allowed {
+		paidName := strings.TrimSuffix(mr.Model, ":free")
+		if retryAfter <= 0 {
+			retryAfter = duration
+		}
+		c.Header("Retry-After", strconv.FormatInt(retryAfter, 10))
+		c.Header("X-RateLimit-Limit", strconv.Itoa(successMaxCount))
+		c.Header("X-RateLimit-Remaining", "0")
+		c.Header("X-RateLimit-Reset", strconv.FormatInt(time.Now().Unix()+retryAfter, 10))
+		// Report the window actually enforced, not the configured one: a
+		// discounted account limited to 45s would otherwise be told "every 1 min".
+		windowLabel := fmt.Sprintf("%v min", duration/60)
+		if duration%60 != 0 {
+			windowLabel = fmt.Sprintf("%vs", duration)
+		}
+		msg := fmt.Sprintf("Too many requests. The free tier allows %v request(s) every %v per account on %v - nothing is used up, retry in %vs. The paid %v has no per-minute limit.",
+			successMaxCount, windowLabel, mr.Model, retryAfter, paidName)
+		// Surface the rejection in the usage logs (aborting here skips the
+		// relay's own error logging entirely), once per account, model and
+		// window: a client that retries in a loop otherwise writes one row per
+		// attempt (24k rows in an hour from one shared guest key). DB guard
+		// keeps unit tests DB-free.
+		if model.DB != nil && rateLimitRejectionLoggable(key, retryAfter) {
+			group := c.GetString("group")
+			// Rate limiting runs before the distributor selects a channel, so attach
+			// the channel the request would have been routed to for log attribution.
+			channelId := 0
+			if ch := model.GetChannelForLog(group, mr.Model, c.Request.URL.Path); ch != nil {
+				channelId = ch.Id
+			}
+			other := model.NewLogOther()
+			other.SetPublic("status_code", http.StatusTooManyRequests)
+			other.SetPublic("retry_after", retryAfter)
+			// This row is a policy decision, not a fault: the request was refused by
+			// our own free-tier limiter and nothing upstream was even asked. It is
+			// marked so error-rate reporting can exclude it; unmarked it was 4.4
+			// points of a 34% "error rate" and made the free tier look broken.
+			other.SetPublic("policy_throttle", true)
+			model.RecordErrorLog(c, c.GetInt("id"), channelId, mr.Model,
+				c.GetString("token_name"), msg, c.GetInt("token_id"), 0, false,
+				group, 0, other)
+		}
+		abortWithOpenAiMessage(c, http.StatusTooManyRequests, msg)
+		return false
+	}
+
+	c.Set(perModelRateLimitKeyMark, key)
+	c.Set(perModelRateLimitMaxMark, successMaxCount)
+	c.Set(perModelRateLimitDurationMark, duration)
+	c.Set(perModelRateLimitMemberMark, member)
+	return true
+}
+
+// settlePerModelRequest finalizes the slot taken at admission: a failed upstream
+// call releases it, so failures stay free without letting concurrent requests
+// through. A success needs no write, because the reservation IS the record.
+func settlePerModelRequest(c *gin.Context) {
+	key := c.GetString(perModelRateLimitKeyMark)
+	maxCount := c.GetInt(perModelRateLimitMaxMark)
+	if key == "" || maxCount <= 0 {
+		return
+	}
+	failed := !modelRequestSucceeded(c)
+	if common.RedisEnabled {
+		member := c.GetString(perModelRateLimitMemberMark)
+		if failed && member != "" {
+			ctx := context.Background()
+			_ = limiter.New(ctx, common.RDB).Release(ctx, key, member)
+		}
+		return
+	}
+	if failed {
+		return
+	}
+	duration := c.GetInt64(perModelRateLimitDurationMark)
+	if duration <= 0 {
+		duration = int64(setting.ModelRequestRateLimitDurationMinutes * 60)
+	}
+	inMemoryRateLimiter.Request(key, maxCount, duration)
+}
+
+func modelRequestSucceeded(c *gin.Context) bool {
+	status, _ := common.GetContextKeyType[*relaycommon.StreamStatus](c, constant.ContextKeyResponseStreamStatus)
+	return c.Writer.Status() < 400 && !status.ResponseFailed()
+}
+
+// ModelRequestRateLimit 模型请求限流中间件
+var rateLimitRejectionLogged sync.Map
+
+// rateLimitRejectionLoggable reports whether a rejection on this rate-limit
+// key has not been logged yet within ttl seconds, and claims the slot if so.
+func rateLimitRejectionLoggable(key string, ttl int64) bool {
+	if key == "" {
+		return true
+	}
+	if ttl <= 0 {
+		ttl = 60
+	}
+	if common.RedisEnabled {
+		ok, err := common.RedisSetNX("rateLimit:logged:"+key, "1", time.Duration(ttl)*time.Second)
+		if err == nil {
+			return ok
+		}
+	}
+	now := time.Now().Unix()
+	if v, found := rateLimitRejectionLogged.Load(key); found && now-v.(int64) < ttl {
+		return false
+	}
+	rateLimitRejectionLogged.Store(key, now)
+	return true
+}
+
+func ModelRequestRateLimit() func(c *gin.Context) {
+	return func(c *gin.Context) {
+		// 在每个请求时检查是否启用限流
+		if !setting.ModelRequestRateLimitEnabled {
+			c.Next()
+			return
+		}
+
+		if !perModelRateLimit(c) {
+			return
+		}
+		defer settlePerModelRequest(c)
+
+		// 计算限流参数
+		duration := rateLimitDurationSeconds(setting.ModelRequestRateLimitDurationMinutes)
+		totalMaxCount := setting.ModelRequestRateLimitCount
+		successMaxCount := setting.ModelRequestRateLimitSuccessCount
+
+		// 获取分组
+		group := common.GetContextKeyString(c, constant.ContextKeyTokenGroup)
+		if group == "" {
+			group = common.GetContextKeyString(c, constant.ContextKeyUserGroup)
+		}
+
+		// 获取分组的限流配置。配置了独立限流的分组按用户和分组单独计数，
+		// 其余分组共用该用户的全局计数
+		subject := strconv.Itoa(c.GetInt("id"))
+		groupTotalCount, groupSuccessCount, found := setting.GetGroupRateLimit(group)
+		if found {
+			totalMaxCount = groupTotalCount
+			successMaxCount = groupSuccessCount
+			subject += ":" + group
+		}
+
+		// 根据存储类型选择并执行限流处理器
+		if common.RedisEnabled {
+			redisRateLimitHandler(subject, duration, totalMaxCount, successMaxCount)(c)
+		} else {
+			memoryRateLimitHandler(subject, duration, totalMaxCount, successMaxCount)(c)
+		}
+	}
+}
+
+func rateLimitDurationSeconds(durationMinutes int) int64 {
+	if durationMinutes <= 0 {
+		return 0
+	}
+	minutes := int64(durationMinutes)
+	if minutes > math.MaxInt64/60 {
+		return math.MaxInt64
+	}
+	return minutes * 60
+}
+
+func rateLimitCapacity(count int, durationSeconds int64) int64 {
+	if count <= 0 || durationSeconds <= 0 {
+		return 0
+	}
+	c := int64(count)
+	if c > math.MaxInt64/durationSeconds {
+		return math.MaxInt64
+	}
+	return c * durationSeconds
+}

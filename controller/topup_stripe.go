@@ -1,0 +1,563 @@
+package controller
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
+
+	"github.com/gin-gonic/gin"
+	"github.com/go-fuego/fuego"
+	"github.com/shopspring/decimal"
+	"github.com/stripe/stripe-go/v81"
+	"github.com/stripe/stripe-go/v81/charge"
+	"github.com/stripe/stripe-go/v81/checkout/session"
+	"github.com/stripe/stripe-go/v81/invoice"
+	"github.com/stripe/stripe-go/v81/webhook"
+	"github.com/thanhpk/randstr"
+)
+
+const (
+	PaymentMethodStripe = "stripe"
+)
+
+func RequestStripeAmount(c fuego.ContextWithBody[dto.StripePayRequest]) (*dto.Response[string], error) {
+	req, err := c.Body()
+	if err != nil {
+		return dto.Fail[string]("Invalid parameters")
+	}
+	if req.Amount < getStripeMinTopup() {
+		return dto.Fail[string](fmt.Sprintf("Top-up amount cannot be less than %v", getStripeMinTopup()))
+	}
+	if req.Amount > 10000 {
+		return dto.Fail[string]("Top-up amount cannot exceed 10000")
+	}
+	id := dto.UserID(c)
+	group, err := model.GetUserGroup(id, true)
+	if err != nil {
+		return dto.Fail[string]("Failed to get user group")
+	}
+	if err := checkCreditedQuota(id, getStripeCreditedQuota(req.Amount, group)); err != nil {
+		return dto.Fail[string](err.Error())
+	}
+	payMoney := getStripePayMoney(float64(req.Amount), group)
+	if payMoney <= 0.01 {
+		return dto.Fail[string]("Top-up amount is too low")
+	}
+	return dto.Ok(strconv.FormatFloat(payMoney, 'f', 2, 64))
+}
+
+func RequestStripePay(c fuego.ContextWithBody[dto.StripePayRequest]) (*dto.Response[dto.StripePayLinkData], error) {
+	ginCtx := dto.GinCtx(c)
+	req, err := c.Body()
+	if err != nil {
+		return dto.Fail[dto.StripePayLinkData]("Invalid parameters")
+	}
+	if req.PaymentMethod != PaymentMethodStripe {
+		return dto.Fail[dto.StripePayLinkData]("Payment channel is not supported")
+	}
+	if req.Amount < getStripeMinTopup() {
+		return dto.Fail[dto.StripePayLinkData](fmt.Sprintf("Top-up amount cannot be less than %v", getStripeMinTopup()))
+	}
+	if req.Amount > 10000 {
+		return dto.Fail[dto.StripePayLinkData]("Top-up amount cannot exceed 10000")
+	}
+
+	if req.SuccessURL != "" && common.ValidateRedirectURL(req.SuccessURL) != nil {
+		return dto.Fail[dto.StripePayLinkData]("Success redirect URL is not in the trusted domain list")
+	}
+
+	if req.CancelURL != "" && common.ValidateRedirectURL(req.CancelURL) != nil {
+		return dto.Fail[dto.StripePayLinkData]("Cancel redirect URL is not in the trusted domain list")
+	}
+
+	id := dto.UserID(c)
+	user, err := model.GetUserById(id, false)
+	if err != nil || user == nil {
+		return dto.Fail[dto.StripePayLinkData]("Failed to get user information")
+	}
+	chargedMoney := GetChargedAmount(float64(req.Amount), *user)
+	if err := checkCreditedQuota(id, decimal.NewFromFloat(chargedMoney).Mul(decimal.NewFromFloat(common.QuotaPerUnit))); err != nil {
+		return dto.Fail[dto.StripePayLinkData](err.Error())
+	}
+
+	if capUSD := setting.CardTopUpNewAccountCapUSD; capUSD > 0 && user.CreatedAt > 0 && time.Now().Unix()-user.CreatedAt < 86400 {
+		committed, err := model.CardMoneyCommitted(id)
+		if err != nil {
+			return dto.Fail[dto.StripePayLinkData]("Failed to create order")
+		}
+		if committed+chargedMoney > capUSD {
+			return dto.Fail[dto.StripePayLinkData](fmt.Sprintf("Card top-ups are limited to $%.0f in total during an account's first 24 hours. Please try again later or pay with crypto.", capUSD))
+		}
+	}
+
+	reference := fmt.Sprintf("new-api-ref-%d-%d-%s", user.Id, time.Now().UnixMilli(), randstr.String(4))
+	referenceId := "ref_" + common.Sha1([]byte(reference))
+
+	payLink, err := genStripeLink(ginCtx, referenceId, user.StripeCustomer, user.Email, req.Amount, req.SuccessURL, req.CancelURL)
+	if err != nil {
+		log.Println("failed to get Stripe Checkout payment link", err)
+		return dto.Fail[dto.StripePayLinkData]("Failed to start payment")
+	}
+
+	topUp := &model.TopUp{
+		UserId:          id,
+		Amount:          req.Amount,
+		Money:           chargedMoney,
+		TradeNo:         referenceId,
+		PaymentMethod:   PaymentMethodStripe,
+		PaymentProvider: model.PaymentProviderStripe,
+		CreateTime:      time.Now().Unix(),
+		Status:          common.TopUpStatusPending,
+	}
+	err = topUp.Insert()
+	if err != nil {
+		return dto.Fail[dto.StripePayLinkData]("Failed to create order")
+	}
+	return dto.Ok(dto.StripePayLinkData{PayLink: payLink})
+}
+
+func StripeWebhook(c *gin.Context) {
+	ctx := c.Request.Context()
+	callerIp := c.ClientIP()
+
+	if setting.StripeWebhookSecret == "" {
+		logger.LogWarn(ctx, fmt.Sprintf("Stripe webhook secret not configured, refusing to process client_ip=%s", callerIp))
+		c.AbortWithStatus(http.StatusForbidden)
+		return
+	}
+
+	payload, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		logger.LogError(ctx, fmt.Sprintf("Stripe webhook failed to parse payload client_ip=%s error=%q", callerIp, err.Error()))
+		c.AbortWithStatus(http.StatusServiceUnavailable)
+		return
+	}
+
+	signature := c.GetHeader("Stripe-Signature")
+	event, err := webhook.ConstructEventWithOptions(payload, signature, setting.StripeWebhookSecret, webhook.ConstructEventOptions{
+		IgnoreAPIVersionMismatch: true,
+	})
+
+	if err != nil {
+		logger.LogWarn(ctx, fmt.Sprintf("Stripe webhook signature verification failed client_ip=%s error=%q", callerIp, err.Error()))
+		c.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+
+	switch event.Type {
+	case stripe.EventTypeCheckoutSessionCompleted:
+		sessionCompleted(ctx, event, callerIp)
+	case stripe.EventTypeCheckoutSessionExpired:
+		sessionExpired(ctx, event)
+	case stripe.EventTypeCheckoutSessionAsyncPaymentSucceeded:
+		sessionAsyncPaymentSucceeded(ctx, event, callerIp)
+	case stripe.EventTypeCheckoutSessionAsyncPaymentFailed:
+		sessionAsyncPaymentFailed(ctx, event, callerIp)
+	case stripe.EventTypeChargeDisputeCreated:
+		stripeReversal(ctx, event, callerIp, true)
+	case stripe.EventTypeChargeRefunded:
+		stripeReversal(ctx, event, callerIp, false)
+	default:
+		logger.LogInfo(ctx, fmt.Sprintf("Stripe webhook ignoring event event_type=%s client_ip=%s", string(event.Type), callerIp))
+	}
+
+	c.Status(http.StatusOK)
+}
+
+func sessionCompleted(ctx context.Context, event stripe.Event, callerIp string) {
+	customerId := event.GetObjectValue("customer")
+	referenceId := event.GetObjectValue("client_reference_id")
+	status := event.GetObjectValue("status")
+	if "complete" != status {
+		logger.LogWarn(ctx, fmt.Sprintf("Stripe checkout.completed abnormal status, ignoring trade_no=%s status=%s client_ip=%s", referenceId, status, callerIp))
+		return
+	}
+
+	paymentStatus := event.GetObjectValue("payment_status")
+	if paymentStatus != "paid" {
+		logger.LogInfo(ctx, fmt.Sprintf("Stripe Checkout payment not completed, waiting for async result trade_no=%s payment_status=%s client_ip=%s", referenceId, paymentStatus, callerIp))
+		return
+	}
+
+	fulfillOrder(ctx, event, referenceId, customerId, callerIp)
+}
+
+// sessionAsyncPaymentSucceeded handles delayed payment methods (bank transfer, SEPA, etc.)
+// that confirm payment after the checkout session completes.
+func sessionAsyncPaymentSucceeded(ctx context.Context, event stripe.Event, callerIp string) {
+	customerId := event.GetObjectValue("customer")
+	referenceId := event.GetObjectValue("client_reference_id")
+	logger.LogInfo(ctx, fmt.Sprintf("Stripe async payment succeeded trade_no=%s client_ip=%s", referenceId, callerIp))
+
+	fulfillOrder(ctx, event, referenceId, customerId, callerIp)
+}
+
+// sessionAsyncPaymentFailed marks orders as failed when delayed payment methods
+// ultimately fail (e.g. bank transfer not received, SEPA rejected).
+func sessionAsyncPaymentFailed(ctx context.Context, event stripe.Event, callerIp string) {
+	referenceId := event.GetObjectValue("client_reference_id")
+	logger.LogWarn(ctx, fmt.Sprintf("Stripe async payment failed trade_no=%s client_ip=%s", referenceId, callerIp))
+
+	if len(referenceId) == 0 {
+		logger.LogWarn(ctx, fmt.Sprintf("Stripe async payment failed event missing order number client_ip=%s", callerIp))
+		return
+	}
+
+	LockOrder(referenceId)
+	defer UnlockOrder(referenceId)
+
+	topUp := model.GetTopUpByTradeNo(referenceId)
+	if topUp == nil {
+		logger.LogWarn(ctx, fmt.Sprintf("Stripe async payment failed but local order does not exist trade_no=%s client_ip=%s", referenceId, callerIp))
+		return
+	}
+
+	if topUp.PaymentProvider != model.PaymentProviderStripe {
+		logger.LogWarn(ctx, fmt.Sprintf("Stripe async payment failed but order payment provider does not match trade_no=%s payment_provider=%s client_ip=%s", referenceId, topUp.PaymentProvider, callerIp))
+		return
+	}
+
+	if topUp.Status != common.TopUpStatusPending {
+		logger.LogInfo(ctx, fmt.Sprintf("Stripe async payment failed but order status is not pending, ignoring trade_no=%s status=%s client_ip=%s", referenceId, topUp.Status, callerIp))
+		return
+	}
+
+	topUp.Status = common.TopUpStatusFailed
+	if err := topUp.Update(); err != nil {
+		logger.LogError(ctx, fmt.Sprintf("Stripe failed to mark topup order as failed trade_no=%s client_ip=%s error=%q", referenceId, callerIp, err.Error()))
+		return
+	}
+	logger.LogInfo(ctx, fmt.Sprintf("Stripe topup order marked as failed trade_no=%s client_ip=%s", referenceId, callerIp))
+}
+
+// stripeReversal answers charge.refunded and charge.dispute.created the way the
+// Creem path does: the quota a one-time top-up granted is taken back, and a
+// dispute also locks the account. Charges are matched through the payment
+// intent recorded at checkout; a refund with no match is left alone, because
+// subscription invoices refund through the same event and must not reverse an
+// unrelated top-up. A dispute with no top-up match still locks the customer.
+func stripeReversal(ctx context.Context, event stripe.Event, callerIp string, dispute bool) {
+	kind := "refund"
+	in := model.TopUpReversalInput{Provider: model.PaymentProviderStripe, EventId: event.ID, Dispute: dispute}
+	if dispute {
+		kind = "dispute"
+		var d stripe.Dispute
+		if err := json.Unmarshal(event.Data.Raw, &d); err != nil {
+			logger.LogError(ctx, fmt.Sprintf("Stripe dispute parse failed event_id=%s error=%q", event.ID, err.Error()))
+			return
+		}
+		if d.PaymentIntent != nil {
+			in.OrderId = d.PaymentIntent.ID
+		}
+		if d.Charge != nil {
+			in.TransactionId = d.Charge.ID
+		}
+		in.PaidCents = int(d.Amount)
+		in.ReversedCents = int(d.Amount)
+		// The dispute names only the charge; the customer behind it is one
+		// fetch away and is what identifies the account when the top-up
+		// predates payment intent recording.
+		if in.TransactionId != "" && setting.StripeApiSecret != "" {
+			stripe.Key = setting.StripeApiSecret
+			if ch, err := charge.Get(in.TransactionId, nil); err == nil && ch != nil && ch.Customer != nil {
+				in.CustomerId = ch.Customer.ID
+			}
+		}
+	} else {
+		var ch stripe.Charge
+		if err := json.Unmarshal(event.Data.Raw, &ch); err != nil {
+			logger.LogError(ctx, fmt.Sprintf("Stripe refund parse failed event_id=%s error=%q", event.ID, err.Error()))
+			return
+		}
+		if ch.PaymentIntent != nil {
+			in.OrderId = ch.PaymentIntent.ID
+		}
+		in.TransactionId = ch.ID
+		in.PaidCents = int(ch.Amount)
+		in.ReversedCents = int(ch.AmountRefunded)
+	}
+
+	lockKey := in.OrderId
+	if lockKey == "" {
+		lockKey = in.TransactionId
+	}
+	if lockKey == "" {
+		lockKey = event.ID
+	}
+	LockOrder(lockKey)
+	defer UnlockOrder(lockKey)
+
+	res, err := model.ReverseTopUp(in)
+	matched := err == nil
+	switch {
+	case errors.Is(err, model.ErrReversalUnmatched):
+		logger.LogWarn(ctx, fmt.Sprintf("Stripe %s could not match user event_id=%s payment_intent=%s charge=%s customer=%s client_ip=%s", kind, event.ID, in.OrderId, in.TransactionId, in.CustomerId, callerIp))
+		return
+	case errors.Is(err, model.ErrTopUpNotFound):
+		logger.LogWarn(ctx, fmt.Sprintf("Stripe %s matched user but no top-up event_id=%s user_id=%d payment_intent=%s charge=%s amount=%d client_ip=%s", kind, event.ID, res.UserId, in.OrderId, in.TransactionId, in.PaidCents, callerIp))
+	case err != nil:
+		logger.LogError(ctx, fmt.Sprintf("Stripe %s processing failed event_id=%s payment_intent=%s error=%q", kind, event.ID, in.OrderId, err.Error()))
+		return
+	}
+
+	if dispute {
+		if derr := model.DisableUserForFraud(res.UserId); derr != nil {
+			logger.LogError(ctx, fmt.Sprintf("Stripe dispute failed to disable user event_id=%s user_id=%d error=%q", event.ID, res.UserId, derr.Error()))
+			return
+		}
+	}
+
+	if matched && res.AlreadyDone {
+		logger.LogInfo(ctx, fmt.Sprintf("Stripe %s already applied event_id=%s user_id=%d top_up_id=%d", kind, event.ID, res.UserId, res.TopUpId))
+		return
+	}
+
+	note := "Stripe {{kind}}: {{quota}} quota reversed, top-up {{top_up_id}}, payment_intent {{order_id}}, charge {{transaction_id}}, event {{event_id}}"
+	if dispute {
+		note += ", account disabled"
+	}
+	model.RecordLog(res.UserId, model.LogTypeRefund, common.NewMessage(note, map[string]any{"kind": kind, "quota": res.QuotaRemoved, "top_up_id": res.TopUpId, "order_id": in.OrderId, "transaction_id": in.TransactionId, "event_id": event.ID}))
+	logger.LogInfo(ctx, fmt.Sprintf("Stripe %s applied event_id=%s user_id=%d top_up_id=%d quota_removed=%d disabled=%t", kind, event.ID, res.UserId, res.TopUpId, res.QuotaRemoved, dispute))
+}
+
+// persistStripeInvoiceUrl resolves the checkout session's invoice into a stable
+// hosted URL and stores it on the paid record. The session event carries only an
+// invoice id, so the document URL needs a follow-up fetch. Best-effort: any
+// failure is logged and never interrupts fulfilment.
+func persistStripeInvoiceUrl(ctx context.Context, event stripe.Event, referenceId string) {
+	invoiceId := event.GetObjectValue("invoice")
+	if invoiceId == "" || setting.StripeApiSecret == "" {
+		return
+	}
+
+	stripe.Key = setting.StripeApiSecret
+	inv, err := invoice.Get(invoiceId, nil)
+	if err != nil || inv == nil || inv.HostedInvoiceURL == "" {
+		if err != nil {
+			logger.LogWarn(ctx, fmt.Sprintf("Stripe fetch invoice url failed trade_no=%s invoice_id=%s error=%q", referenceId, invoiceId, err.Error()))
+		}
+		return
+	}
+
+	if err := model.SetPaymentInvoiceUrl(referenceId, inv.HostedInvoiceURL); err != nil {
+		logger.LogWarn(ctx, fmt.Sprintf("Stripe persist invoice url failed trade_no=%s error=%q", referenceId, err.Error()))
+	}
+}
+
+// fulfillOrder is the shared logic for crediting quota after payment is confirmed.
+func fulfillOrder(ctx context.Context, event stripe.Event, referenceId string, customerId string, callerIp string) {
+	if len(referenceId) == 0 {
+		logger.LogWarn(ctx, fmt.Sprintf("Stripe order number missing when fulfilling order client_ip=%s", callerIp))
+		return
+	}
+
+	LockOrder(referenceId)
+	defer UnlockOrder(referenceId)
+	payload := map[string]any{
+		"customer":     customerId,
+		"amount_total": event.GetObjectValue("amount_total"),
+		"currency":     strings.ToUpper(event.GetObjectValue("currency")),
+		"event_type":   string(event.Type),
+	}
+	if err := model.CompleteSubscriptionOrder(referenceId, common.GetJsonString(payload), model.PaymentProviderStripe, ""); err == nil {
+		logger.LogInfo(ctx, fmt.Sprintf("Stripe subscription order processed successfully trade_no=%s event_type=%s client_ip=%s", referenceId, string(event.Type), callerIp))
+		persistStripeInvoiceUrl(ctx, event, referenceId)
+		return
+	} else if err != nil && !errors.Is(err, model.ErrSubscriptionOrderNotFound) {
+		logger.LogError(ctx, fmt.Sprintf("Stripe subscription order processing failed trade_no=%s event_type=%s client_ip=%s error=%q", referenceId, string(event.Type), callerIp, err.Error()))
+		return
+	}
+
+	// Same reason as the Creem path: without this the stuck-top-up alert cannot
+	// tell a paid order that never settled from a checkout nobody completed.
+	// Recorded before settling so a failure below still leaves the evidence.
+	if paid, parseErr := strconv.ParseFloat(event.GetObjectValue("amount_total"), 64); parseErr == nil && paid > 0 {
+		if err := model.SetTopUpPaidAmount(referenceId, paid/100); err != nil {
+			logger.LogError(ctx, fmt.Sprintf("Stripe failed to record paid amount trade_no=%s amount_total=%.2f error=%q", referenceId, paid/100, err.Error()))
+		}
+	}
+
+	// The payment intent is what a later dispute or refund event carries.
+	if pi := event.GetObjectValue("payment_intent"); pi != "" {
+		if err := model.SetTopUpProviderPaymentId(referenceId, pi); err != nil {
+			logger.LogError(ctx, fmt.Sprintf("Stripe failed to record payment intent trade_no=%s payment_intent=%s error=%q", referenceId, pi, err.Error()))
+		}
+	}
+
+	err := model.Recharge(referenceId, customerId, callerIp)
+	if err != nil {
+		logger.LogError(ctx, fmt.Sprintf("Stripe topup processing failed trade_no=%s event_type=%s client_ip=%s error=%q", referenceId, string(event.Type), callerIp, err.Error()))
+		return
+	}
+
+	persistStripeInvoiceUrl(ctx, event, referenceId)
+
+	total, _ := strconv.ParseFloat(event.GetObjectValue("amount_total"), 64)
+	currency := strings.ToUpper(event.GetObjectValue("currency"))
+	logger.LogInfo(ctx, fmt.Sprintf("Stripe topup succeeded trade_no=%s amount_total=%.2f currency=%s event_type=%s client_ip=%s", referenceId, total/100, currency, string(event.Type), callerIp))
+
+	if topUp := model.GetTopUpByTradeNo(referenceId); topUp != nil {
+	}
+}
+
+func sessionExpired(ctx context.Context, event stripe.Event) {
+	referenceId := event.GetObjectValue("client_reference_id")
+	status := event.GetObjectValue("status")
+	if "expired" != status {
+		logger.LogWarn(ctx, fmt.Sprintf("Stripe checkout.expired abnormal status, ignoring trade_no=%s status=%s", referenceId, status))
+		return
+	}
+
+	if len(referenceId) == 0 {
+		logger.LogWarn(ctx, "Stripe checkout.expired missing order number")
+		return
+	}
+
+	// Subscription order expiration
+	LockOrder(referenceId)
+	defer UnlockOrder(referenceId)
+	if err := model.ExpireSubscriptionOrder(referenceId, model.PaymentProviderStripe); err == nil {
+		logger.LogInfo(ctx, fmt.Sprintf("Stripe subscription order expired trade_no=%s", referenceId))
+		return
+	} else if err != nil && !errors.Is(err, model.ErrSubscriptionOrderNotFound) {
+		logger.LogError(ctx, fmt.Sprintf("Stripe subscription order expiration processing failed trade_no=%s error=%q", referenceId, err.Error()))
+		return
+	}
+
+	err := model.UpdatePendingTopUpStatus(referenceId, model.PaymentProviderStripe, common.TopUpStatusExpired)
+	if errors.Is(err, model.ErrTopUpNotFound) {
+		logger.LogWarn(ctx, fmt.Sprintf("Stripe topup order does not exist, cannot mark as expired trade_no=%s", referenceId))
+		return
+	}
+	if err != nil {
+		logger.LogError(ctx, fmt.Sprintf("Stripe topup order expiration processing failed trade_no=%s error=%q", referenceId, err.Error()))
+		return
+	}
+
+	logger.LogInfo(ctx, fmt.Sprintf("Stripe topup order expired trade_no=%s", referenceId))
+}
+
+// genStripeLink generates a Stripe Checkout session URL for payment.
+func genStripeLink(c *gin.Context, referenceId string, customerId string, email string, amount int64, successURL string, cancelURL string) (string, error) {
+	if !strings.HasPrefix(setting.StripeApiSecret, "sk_") && !strings.HasPrefix(setting.StripeApiSecret, "rk_") {
+		return "", fmt.Errorf("invalid Stripe API key")
+	}
+
+	stripe.Key = setting.StripeApiSecret
+
+	// Use custom URLs if provided, otherwise use defaults
+	if successURL == "" {
+		successURL = paymentReturnPath(c, "/usage-logs")
+	}
+	if cancelURL == "" {
+		cancelURL = paymentReturnPath(c, "/wallet")
+	}
+
+	params := &stripe.CheckoutSessionParams{
+		ClientReferenceID: stripe.String(referenceId),
+		SuccessURL:        stripe.String(successURL),
+		CancelURL:         stripe.String(cancelURL),
+		LineItems: []*stripe.CheckoutSessionLineItemParams{
+			{
+				Price:    stripe.String(setting.StripePriceId),
+				Quantity: stripe.Int64(amount),
+			},
+		},
+		Mode:                stripe.String(string(stripe.CheckoutSessionModePayment)),
+		AllowPromotionCodes: stripe.Bool(setting.StripePromotionCodesEnabled),
+		// Payment mode issues only a receipt by default; opt in so one-off top-ups
+		// produce a real invoice with a stable hosted URL the user can reopen.
+		InvoiceCreation: &stripe.CheckoutSessionInvoiceCreationParams{
+			Enabled: stripe.Bool(true),
+		},
+	}
+
+	if setting.StripeRequest3DS && !setting.StripeManagedPayments {
+		params.PaymentMethodOptions = &stripe.CheckoutSessionPaymentMethodOptionsParams{
+			Card: &stripe.CheckoutSessionPaymentMethodOptionsCardParams{
+				RequestThreeDSecure: stripe.String(string(stripe.CheckoutSessionPaymentMethodOptionsCardRequestThreeDSecureAny)),
+			},
+		}
+	}
+
+	if "" == customerId {
+		if "" != email {
+			params.CustomerEmail = stripe.String(email)
+		}
+
+		params.CustomerCreation = stripe.String(string(stripe.CheckoutSessionCustomerCreationAlways))
+	} else {
+		params.Customer = stripe.String(customerId)
+	}
+
+	applyStripeManagedPayments(params)
+
+	result, err := session.New(params)
+	if err != nil {
+		return "", err
+	}
+
+	return result.URL, nil
+}
+
+func GetChargedAmount(count float64, user model.User) float64 {
+	topUpGroupRatio := common.GetTopupGroupRatio(user.Group)
+	if topUpGroupRatio == 0 {
+		topUpGroupRatio = 1
+	}
+
+	return count * topUpGroupRatio
+}
+
+func getStripeCreditedQuota(amount int64, group string) decimal.Decimal {
+	topUpGroupRatio := common.GetTopupGroupRatio(group)
+	if topUpGroupRatio == 0 {
+		topUpGroupRatio = 1
+	}
+	return decimal.NewFromInt(amount).
+		Mul(decimal.NewFromFloat(topUpGroupRatio)).
+		Mul(decimal.NewFromFloat(common.QuotaPerUnit))
+}
+
+func getStripePayMoney(amount float64, group string) float64 {
+	originalAmount := amount
+	if operation_setting.GetQuotaDisplayType() == operation_setting.QuotaDisplayTypeTokens {
+		amount = amount / common.QuotaPerUnit
+	}
+	// Using float64 for monetary calculations is acceptable here due to the small amounts involved
+	topupGroupRatio := common.GetTopupGroupRatio(group)
+	if topupGroupRatio == 0 {
+		topupGroupRatio = 1
+	}
+	// apply optional preset discount by the original request amount (if configured), default 1.0
+	discount := 1.0
+	if ds, ok := operation_setting.GetPaymentSetting().AmountDiscount[int(originalAmount)]; ok {
+		if ds > 0 {
+			discount = ds
+		}
+	}
+	payMoney := amount * setting.StripeUnitPrice * topupGroupRatio * discount
+	return payMoney
+}
+
+func getStripeMinTopup() int64 {
+	minTopup := setting.StripeMinTopUp
+	if operation_setting.GetQuotaDisplayType() == operation_setting.QuotaDisplayTypeTokens {
+		minTopup = minTopup * int(common.QuotaPerUnit)
+	}
+	return int64(minTopup)
+}

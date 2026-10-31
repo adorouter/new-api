@@ -1,0 +1,738 @@
+package router
+
+import (
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/controller"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/middleware"
+	"github.com/QuantumNous/new-api/service/authz"
+
+	// Import oauth package to register providers via init()
+	_ "github.com/QuantumNous/new-api/oauth"
+
+	"github.com/gin-contrib/gzip"
+	"github.com/gin-gonic/gin"
+	"github.com/go-fuego/fuego"
+	"github.com/go-fuego/fuego/option"
+)
+
+func SetApiRouter(router *gin.Engine, engine *fuego.Engine) {
+	apiRouter := router.Group("/api")
+	apiRouter.Use(middleware.RouteTag("api"))
+	apiRouter.Use(middleware.LimitRequestBody(16))
+	apiRouter.Use(gzip.Gzip(gzip.DefaultCompression))
+	apiRouter.Use(middleware.BodyStorageCleanup())
+	apiRouter.Use(middleware.GlobalAPIRateLimit())
+	{
+		// ---- Public routes (no auth) ----
+		setup := dto.NewRouter(engine, apiRouter, "Setup", secPublic())
+		dto.Get(setup, "/setup", controller.GetSetup)
+		dto.PostB(setup, "/setup", controller.PostSetup)
+
+		system := dto.NewRouter(engine, apiRouter, "System", secPublic())
+		dto.Get(system, "/status", controller.GetStatus)
+		dto.Get(system, "/uptime/status", controller.GetUptimeKumaStatus)
+		dto.Get(system, "/notice", controller.GetNotice)
+		dto.Get(system, "/user-agreement", controller.GetUserAgreement)
+		dto.Get(system, "/privacy-policy", controller.GetPrivacyPolicy)
+		dto.Get(system, "/about", controller.GetAbout)
+		dto.Get(system, "/home_page_content", controller.GetHomePageContent)
+		dto.Get(system, "/midjourney", controller.GetMidjourney)
+		dto.Get(system, "/ratio_config", controller.GetRatioConfig)
+
+		// Public routes with inline middleware
+		publicModels := dto.NewRouter(engine, apiRouter.Group("", middleware.UserAuth()), "Models", secDashboard())
+		dto.Get(publicModels, "/models", controller.DashboardListModels)
+
+		publicAdminSystem := dto.NewRouter(engine, apiRouter.Group("", middleware.AdminAuth()), "System", secDashboard())
+		dto.Get(publicAdminSystem, "/status/test", controller.TestStatus)
+
+		publicPricing := dto.NewRouter(engine, apiRouter.Group("", middleware.InflightLimit(middleware.InflightPublic), middleware.TryUserAuth()), "Pricing", secPublic())
+		dto.Get(publicPricing, "/pricing", controller.GetPricing)
+		dto.Get(publicPricing, "/pricing/catalog", controller.GetPricingCatalog, dto.CatalogFullQuery(), dto.CatalogVendorQuery(), dto.CatalogEndpointQuery(), dto.CatalogTypeQuery(), dto.CatalogOfflineQuery())
+		dto.Get(publicPricing, "/pricing/vendors", controller.GetPricingVendors)
+		dto.Get(publicPricing, "/pricing/counts", controller.GetPricingCounts)
+		dto.Get(publicPricing, "/pricing/model-groups", controller.GetPricingModelGroups, dto.ModelQuery())
+		dto.Get(publicPricing, "/pricing/catalog/model", controller.GetPricingCatalogModel, dto.ModelQuery())
+
+		publicPerfMetrics := dto.NewRouter(engine, apiRouter.Group("", middleware.InflightLimit(middleware.InflightAnalytics), middleware.TryUserAuth()), "PerfMetrics", secPublic())
+		dto.GetP(publicPerfMetrics, "/perf-metrics/summary", controller.GetPerfMetricsSummary)
+		dto.GetP(publicPerfMetrics, "/perf-metrics", controller.GetPerfMetrics)
+
+		publicRankings := dto.NewRouter(engine, apiRouter.Group("", middleware.InflightLimit(middleware.InflightAnalytics)), "Rankings", secPublic())
+		dto.GetP(publicRankings, "/rankings", controller.GetRankings)
+		dto.GetP(publicRankings, "/rankings/model", controller.GetModelRanking)
+
+		// Aggregate platform totals and model health, both rendered to anonymous
+		// visitors on the public stats and status pages. Neither reads user context.
+		publicStats := dto.NewRouter(engine, apiRouter.Group("", middleware.InflightLimit(middleware.InflightPublic), middleware.TryUserAuth()), "Stats", secPublic())
+		// Its own slot pool: every distinct hour is a fresh quota_data scan, and sharing
+		// the public pool let a flood of them turn the pricing and status pages into 429s.
+		publicDataSummary := dto.NewRouter(engine, apiRouter.Group("", middleware.InflightLimit(middleware.InflightAnalytics), middleware.TryUserAuth()), "Stats", secPublic())
+		dto.GetP(publicDataSummary, "/data/summary", controller.GetQuotaDataSummary)
+		dto.Get(publicStats, "/model_status/components", controller.GetModelStatusComponents)
+		dto.GetP(publicStats, "/model_status/buckets", controller.GetModelStatusBuckets)
+		dto.GetP(publicStats, "/model_status/page_compact", controller.GetModelStatusPageCompact)
+		dto.GetP(publicStats, "/log/by-request", controller.GetLogByRequest)
+
+		publicEmailVerify := dto.NewRouter(engine, apiRouter.Group("", middleware.EmailVerificationRateLimit(), middleware.TurnstileCheck()), "Auth", secPublic())
+		dto.GetP(publicEmailVerify, "/verification", controller.SendEmailVerification, dto.TurnstileQuery())
+
+		publicResetPwd := dto.NewRouter(engine, apiRouter.Group("", middleware.CriticalRateLimit(), middleware.TurnstileCheck()), "Auth", secPublic())
+		dto.GetP(publicResetPwd, "/reset_password", controller.SendPasswordResetEmail, dto.TurnstileQuery())
+
+		publicCritical := dto.NewRouter(engine, apiRouter.Group("", middleware.CriticalRateLimit()), "Auth", secPublic())
+		dto.PostB(publicCritical, "/user/reset", controller.ResetPassword)
+
+		// OAuth routes (stay as *gin.Context -- sessions/redirects)
+		oauthCritical := dto.NewRouter(engine, apiRouter.Group("", middleware.CORS(), middleware.CriticalRateLimit()), "OAuth", secPublic())
+		// State creation and the provider callback resolve an optional dashboard
+		// session (same-origin bind and verify intents need it); anonymous login
+		// flows pass through TryUserAuth untouched.
+		oauthSession := dto.NewRouter(engine, apiRouter.Group("", middleware.CORS(), middleware.CriticalRateLimit(), middleware.DisableCache(), middleware.TryUserAuthLenient()), "OAuth", secPublic())
+		// GET is the external frontend's (BFF) entry, POST the built-in one. Both
+		// challenge anonymous callers: this is where a new OAuth account starts.
+		oauthState := dto.NewRouter(engine, apiRouter.Group("", middleware.CORS(), middleware.CriticalRateLimit(), middleware.DisableCache(), middleware.TryUserAuthLenient(), middleware.TurnstileCheckAnonymous()), "OAuth", secPublic())
+		dto.GetP(oauthState, "/oauth/state", controller.GenerateOAuthCodeQuery, dto.TurnstileQuery())
+		oauthState.GinPost("/oauth/state", controller.GenerateOAuthCode, dto.GinResp[dto.ApiResponse](), dto.TurnstileQuery())
+		dto.PostB(oauthCritical, "/oauth/exchange", controller.ExchangeOAuthCode)
+		// Binding an email to the CURRENT account, so it needs the caller
+		// identified. The handler's own fallback only accepts a system access
+		// token, which a browser session never carries.
+		oauthEmailBind := dto.NewRouter(engine, apiRouter.Group("", middleware.CORS(), middleware.UserAuth(), middleware.SessionOnly(), middleware.CriticalRateLimit()), "OAuth", secDashboard())
+		dto.GetP(oauthEmailBind, "/oauth/email/bind", controller.EmailBind)
+		// The built-in frontend's proof-gated email bind flow (start, resend, confirm).
+		oauthEmailBindVerified := dto.NewRouter(engine, apiRouter.Group("", middleware.CORS(), middleware.UserAuth(), middleware.CriticalRateLimit(), middleware.UserCriticalRateLimit("account-security"), middleware.DisableCache()), "OAuth", secDashboard())
+		oauthEmailBindStart := dto.NewRouter(engine, apiRouter.Group("", middleware.CORS(), middleware.UserAuth(), middleware.CriticalRateLimit(), middleware.UserCriticalRateLimit("account-security"), middleware.EmailVerificationRateLimit(), middleware.DisableCache()), "OAuth", secDashboard())
+		oauthEmailBindStart.GinPost("/oauth/email/bind/start", controller.EmailBindStart, dto.GinResp[dto.ApiResponse]())
+		oauthEmailBindStart.GinPost("/oauth/email/bind/resend", controller.EmailBindResend, dto.GinResp[dto.ApiResponse]())
+		oauthEmailBindVerified.GinPost("/oauth/email/bind", controller.EmailBindVerified, dto.GinResp[dto.ApiResponse]())
+		oauthCritical.GinGet("/oauth/wechat", controller.WeChatAuth, option.Query("code", "WeChat auth code"), dto.GinResp[dto.ApiResponse]())
+		oauthWechatBind := dto.NewRouter(engine, apiRouter.Group("", middleware.CORS(), middleware.UserAuth(), middleware.CriticalRateLimit()), "OAuth", secDashboard())
+		oauthWechatBind.GinPost("/oauth/wechat/bind", controller.WeChatBind, dto.GinResp[dto.ApiResponse]())
+		// The legacy Telegram widget endpoints answer 410; Telegram now runs through
+		// the unified /oauth/:provider flow.
+		oauthCritical.GinGet("/oauth/telegram/login", controller.TelegramLegacyAuth, dto.GinResp[dto.ApiResponse]())
+		oauthTelegramBindStart := dto.NewRouter(engine, apiRouter.Group("", middleware.UserAuth(), middleware.CriticalRateLimit(), middleware.DisableCache()), "OAuth", secDashboard())
+		oauthTelegramBindStart.GinPost("/oauth/telegram/bind/start", controller.TelegramLegacyAuth, dto.GinResp[dto.ApiResponse]())
+		oauthCritical.GinGet("/oauth/telegram/bind/:flow_token", controller.TelegramLegacyAuth, option.Path("flow_token", "Telegram bind flow token"), dto.GinResp[dto.ApiResponse]())
+		oauthSession.GinGet("/oauth/:provider", controller.HandleOAuth, option.Path("provider", "OAuth provider name"), option.Query("state", "OAuth state"), option.Query("code", "OAuth authorization code"), dto.GinResp[dto.ApiResponse]())
+
+		// Payment webhooks (no auth, stay as *gin.Context -- raw body/writer)
+		paymentWebhook := dto.NewRouter(engine, apiRouter, "Payment", secPublic())
+		paymentWebhook.GinPost("/stripe/webhook", controller.StripeWebhook, dto.GinResp[dto.MessageResponse]())
+		paymentWebhook.GinPost("/creem/webhook", controller.CreemWebhook, dto.GinResp[dto.MessageResponse]())
+		paymentWebhook.GinPost("/nowpayments/webhook", controller.NowPaymentsWebhook, dto.GinResp[dto.MessageResponse]())
+		paymentWebhook.GinPost("/delopay/webhook", controller.DeloPayWebhook, dto.GinResp[dto.MessageResponse]())
+		paymentWebhook.GinPost("/waffo/webhook", controller.WaffoWebhook, dto.GinResp[dto.MessageResponse]())
+		// :env is matched against the event's own mode, so each environment gets
+		// its own callback URL registered upstream.
+		paymentWebhook.GinPost("/waffo-pancake/webhook/:env", controller.WaffoPancakeWebhook, option.Path("env", "Webhook environment (test or prod)"), dto.GinResp[dto.MessageResponse]())
+
+		// Secure verification (stays as *gin.Context -- sessions)
+		verify := dto.NewRouter(engine, apiRouter.Group("", middleware.UserAuth(), middleware.CriticalRateLimit()), "Auth", secDashboard())
+		verify.GinPost("/verify", controller.UniversalVerify, dto.GinResp[dto.Response[dto.SecurityProof]](), dto.GinBody[dto.UniversalVerifyRequest]())
+		verifyMethods := dto.NewRouter(engine, apiRouter.Group("", middleware.UserAuth(), middleware.DisableCache()), "Auth", secDashboard())
+		verifyMethods.GinGet("/verify/methods", controller.GetVerificationMethods, option.Query("scope", "Step-up scope to list the verification methods for", fuego.ParamRequired()), dto.GinResp[dto.Response[dto.VerificationRequirements]]())
+
+		// ---- User routes ----
+		userGroup := apiRouter.Group("/user")
+
+		// Public user routes (stay as *gin.Context -- sessions)
+		userPublicTurnstile := dto.NewRouter(engine, userGroup.Group("", middleware.CriticalRateLimit(), middleware.TurnstileCheck()), "User", secPublic())
+		dto.PostB(userPublicTurnstile, "/register", controller.Register, dto.TurnstileQuery())
+		userPublicTurnstile.GinPost("/login", controller.Login, dto.GinResp[dto.Response[dto.LoginData]](), dto.GinBody[dto.LoginRequest](), dto.TurnstileQuery())
+		userPublicCritical := dto.NewRouter(engine, userGroup.Group("", middleware.CriticalRateLimit()), "User", secPublic())
+		userPublicCritical.GinPost("/login/2fa", controller.Verify2FALogin, dto.GinResp[dto.Response[dto.LoginData]](), dto.GinBody[dto.Verify2FARequest]())
+		userPublicCritical.GinPost("/login/verify", controller.VerifyLogin, dto.GinResp[dto.Response[dto.LoginData]]())
+		userPublicCritical.GinPost("/login/passkey/begin", controller.LoginPasskeyBegin, dto.GinResp[dto.ApiResponse]())
+		userPublicCritical.GinPost("/login/passkey/finish", controller.LoginPasskeyFinish, dto.GinResp[dto.Response[dto.LoginData]]())
+		userPublicCritical.GinPost("/passkey/login/begin", controller.PasskeyLoginBegin, dto.GinResp[dto.Response[dto.PasskeyOptionsData]]())
+		userPublicCritical.GinPost("/passkey/login/finish", controller.PasskeyLoginFinish, dto.GinResp[dto.Response[dto.LoginData]]())
+		userGroup.GET("/login/encryption-key", middleware.DisableCache(), controller.GetPasswordEncryptionKey)
+		userGroup.POST("/auth/refresh", middleware.SessionCookieOriginGuard(), middleware.CriticalRateLimit(), middleware.DisableCache(), controller.RefreshAuth)
+		userGroup.POST("/auth/logout", middleware.SessionCookieOriginGuard(), middleware.CriticalRateLimit(), middleware.DisableCache(), controller.AuthLogout)
+		userPublic := dto.NewRouter(engine, userGroup, "User", secPublic())
+		dto.Get(userPublic, "/logout", controller.Logout)
+		dto.Get(userPublic, "/groups", controller.GetUserGroups)
+		// Guest consents: the handlers accept only the chat BFF (service secret plus X-Guest-Id).
+		dto.Get(userPublic, "/guest/own-purpose-objection", controller.GetGuestOwnPurposeObjection)
+		dto.PutB(userPublic, "/guest/own-purpose-objection", controller.SetGuestOwnPurposeObjection)
+		dto.Get(userPublic, "/guest/provider-consents", controller.GetGuestProviderConsents)
+		dto.PostB(userPublic, "/guest/provider-consents", controller.GrantGuestProviderConsents)
+		dto.DeleteB(userPublic, "/guest/provider-consents", controller.RevokeGuestProviderConsent)
+
+		userPaymentPublic := dto.NewRouter(engine, userGroup, "Payment", secPublic())
+		userPaymentPublic.GinPost("/epay/notify", controller.EpayNotify, dto.GinResp[dto.MessageResponse]())
+		userPaymentPublic.GinGet("/epay/notify", controller.EpayNotify, dto.GinResp[dto.MessageResponse]())
+
+		// Self routes (UserAuth)
+		// DisableCache runs ahead of auth so even a 401 is never cached.
+		selfGroup := userGroup.Group("", middleware.DisableCache(), middleware.UserAuth())
+		self := dto.NewRouter(engine, selfGroup, "User", secDashboard())
+		dto.Get(self, "/self/groups", controller.GetUserGroups)
+		// /self exposes balance + quota — gated by `balance:read` for OAuth agents.
+		selfRead := dto.NewRouter(engine, selfGroup.Group("", middleware.RequireScope("balance:read")), "User", secDashboard())
+		dto.Get(selfRead, "/self", controller.GetSelf)
+		// /models — user-scoped model list, gated by `models:read` for OAuth agents.
+		selfModels := dto.NewRouter(engine, selfGroup.Group("", middleware.RequireScope("models:read")), "User", secDashboard())
+		dto.Get(selfModels, "/models", controller.GetUserModels)
+		selfCriticalUser := dto.NewRouter(engine, selfGroup.Group("", middleware.CriticalRateLimit()), "User", secDashboard())
+		// The caller's own credential surface. A PAT is a bearer secret with no
+		// second factor, so it must not be able to mint its replacement or detach
+		// the identities that can log in as this account.
+		selfCred := dto.NewRouter(engine, selfGroup.Group("", middleware.SessionOnly()), "User", secDashboard())
+		dto.Put(selfCriticalUser, "/self", controller.UpdateSelf)
+		dto.PutB(self, "/self/timeout", controller.UpdateTimeoutPreference)
+		dto.Get(self, "/self/provider-consents", controller.GetProviderConsents)
+		dto.PostB(self, "/self/provider-consents", controller.GrantProviderConsents)
+		dto.DeleteB(self, "/self/provider-consents", controller.RevokeProviderConsent)
+		dto.Get(self, "/self/terms-acceptance", controller.GetTermsAcceptance)
+		dto.PostB(self, "/self/terms-acceptance", controller.AcceptTerms)
+		dto.Get(self, "/self/own-purpose-objection", controller.GetOwnPurposeObjection)
+		dto.PutB(self, "/self/own-purpose-objection", controller.SetOwnPurposeObjection)
+		dto.Delete(selfCred, "/self", controller.DeleteSelf)
+		dto.Get(selfCred, "/token", controller.GenerateAccessToken)
+		accessTokenGroup := selfGroup.Group("/access_tokens", middleware.SessionOnly())
+		accessTokens := dto.NewRouter(engine, accessTokenGroup, "User", secDashboard())
+		accessTokenWrites := dto.NewRouter(engine, accessTokenGroup.Group("", middleware.CriticalRateLimit(), middleware.UserCriticalRateLimit("access-token")), "User", secDashboard())
+		accessTokens.GinGet("", controller.ListAccessTokens, dto.GinResp[dto.ApiResponse]())
+		accessTokens.GinGet("/catalog", controller.GetAccessTokenCatalog, dto.GinResp[dto.ApiResponse]())
+		accessTokens.GinGet("/scopes", controller.GetAccessTokenScopes, dto.GinResp[dto.ApiResponse]())
+		accessTokenWrites.GinPost("", controller.CreateAccessToken, dto.GinResp[dto.ApiResponse]())
+		accessTokenWrites.GinPatch("/:id", controller.UpdateAccessToken, option.Path("id", "Access token ID"), dto.GinResp[dto.ApiResponse]())
+		accessTokenWrites.GinDelete("/legacy", controller.RevokeLegacyAccessToken, dto.GinResp[dto.ApiResponse]())
+		accessTokenWrites.GinDelete("/:id", controller.DeleteAccessToken, option.Path("id", "Access token ID"), dto.GinResp[dto.ApiResponse]())
+		self.GinGet("/passkey", controller.PasskeyStatus, dto.GinResp[dto.Response[dto.PasskeyStatusData]]())
+		self.GinPost("/passkey/register/begin", controller.PasskeyRegisterBegin, dto.GinResp[dto.Response[dto.PasskeyOptionsData]]())
+		self.GinPost("/passkey/register/finish", controller.PasskeyRegisterFinish, dto.GinResp[dto.Response[dto.AuthRotationData]](), dto.GinBody[dto.PasskeyFinishRequest]())
+		self.GinPost("/passkey/verify/begin", controller.PasskeyVerifyBegin, dto.GinResp[dto.Response[dto.PasskeyOptionsData]](), dto.GinBody[dto.PasskeyVerifyBeginRequest]())
+		self.GinPost("/passkey/verify/finish", controller.PasskeyVerifyFinish, dto.GinResp[dto.Response[dto.SecurityProof]](), dto.GinBody[dto.PasskeyFinishRequest]())
+		self.GinDelete("/passkey", controller.PasskeyDelete, dto.GinResp[dto.Response[dto.AuthRotationData]]())
+		self.GinGet("/sessions", controller.GetLoginSessions, dto.GinResp[dto.ApiResponse]())
+		self.GinPost("/sessions/revoke-others", controller.RevokeOtherLoginSessions, dto.GinResp[dto.ApiResponse]())
+		self.GinDelete("/sessions/:sid", controller.DeleteLoginSession, option.Path("sid", "Login session ID"), dto.GinResp[dto.ApiResponse]())
+		dto.Get(self, "/aff", controller.GetAffCode)
+		dto.GetP(self, "/aff/invitees", controller.GetInvitedUsers, dto.PageParams())
+		dto.GetP(self, "/aff/commissions", controller.GetReferralCommissions, dto.PageParams())
+
+		// Payment methods and their minimums are operator settings, identical for
+		// every caller, and the public pricing page renders them before anyone
+		// logs in. Reads no user context, so it needs no session.
+		publicTopUp := dto.NewRouter(engine, userGroup.Group("", middleware.TryUserAuth()), "TopUp", secPublic())
+		dto.Get(publicTopUp, "/topup/info", controller.GetTopUpInfo)
+
+		selfTopUp := self.WithTag("TopUp")
+		dto.GetP(selfTopUp, "/topup/self", controller.GetUserTopUps, dto.PageParams())
+		dto.PostB(selfTopUp, "/amount", controller.RequestAmount)
+		dto.PostB(selfTopUp, "/stripe/amount", controller.RequestStripeAmount)
+		dto.PostB(selfTopUp, "/nowpayments/amount", controller.RequestNowPaymentsAmount)
+		dto.PostB(selfTopUp, "/delopay/amount", controller.RequestDeloPayAmount)
+		selfTopUp.GinPost("/waffo/amount", controller.RequestWaffoAmount, dto.GinResp[dto.ApiResponse]())
+		selfTopUp.GinPost("/waffo-pancake/amount", controller.RequestWaffoPancakeAmount, dto.GinResp[dto.ApiResponse]())
+
+		dto.PostB(self, "/aff_transfer", controller.TransferAffQuota)
+		dto.PostB(self, "/setting", controller.UpdateUserSetting)
+		// The built-in frontend sends PUT; the BFF keeps POST.
+		dto.PutB(self, "/setting", controller.UpdateUserSetting)
+
+		// Enterprise partner API: mint gift cards and grant balance, both funded
+		// from the caller's own wallet. On selfGroup so a PAT works (these are
+		// meant to be scripted) and rate limited because every call moves money.
+		// Authorization is per-handler: requirePartner refuses anyone without a
+		// negotiated top-up bonus.
+		partner := dto.NewRouter(engine, selfGroup.Group("/partner", middleware.CriticalRateLimit()), "Partner", secDashboard())
+		dto.PostB(partner, "/redemption", controller.PartnerCreateRedemption)
+		dto.Get(partner, "/redemption", controller.PartnerListRedemptions, dto.PageParams())
+		dto.Delete(partner, "/redemption/:id", controller.PartnerVoidRedemption, option.Path("id", "Redemption ID"))
+		dto.PostB(partner, "/grant", controller.PartnerGrantQuota)
+
+		// Billing portal URL (Stripe one-time session, or Creem per-customer/fallback).
+		// Gated by subscription:cancel for OAuth agents; humans pass through.
+		selfBilling := dto.NewRouter(engine, selfGroup.Group("", middleware.RequireScope("subscription:cancel")), "Billing", secDashboard())
+		dto.Get(selfBilling, "/billing-portal", controller.GetBillingPortal, fuego.OptionQuery("provider", "Payment provider portal to open (stripe|creem); defaults to the latest payment"))
+
+		apiRouter.GET("/data/users", middleware.ModAuth(), controller.GetQuotaDatesByUser)
+
+		// Self routes with rate limiting.
+		// Checkout-creating endpoints are gated by `checkout:create` when the
+		// caller is an OAuth agent; the scope check is a no-op for humans.
+		selfCritical := dto.NewRouter(engine, selfGroup.Group("", middleware.CriticalRateLimit(), middleware.RequireScope("checkout:create")), "TopUp", secDashboard())
+		dto.PostB(selfCritical, "/topup", controller.TopUp)
+		dto.PostB(selfCritical, "/pay", controller.RequestEpay)
+		dto.PostB(selfCritical, "/stripe/pay", controller.RequestStripePay)
+		dto.PostB(selfCritical, "/creem/pay", controller.RequestCreemPay)
+		dto.PostB(selfCritical, "/nowpayments/pay", controller.RequestNowPaymentsPay)
+		dto.PostB(selfCritical, "/delopay/pay", controller.RequestDeloPayPay)
+		selfCritical.GinPost("/waffo/pay", controller.RequestWaffoPay, dto.GinResp[dto.ApiResponse]())
+		selfCritical.GinPost("/waffo-pancake/pay", controller.RequestWaffoPancakePay, dto.GinResp[dto.ApiResponse]())
+
+		// 2FA routes
+		self2FA := dto.NewRouter(engine, selfGroup.Group("", middleware.DisableCache()), "2FA", secDashboard())
+		self2FAEnroll := dto.NewRouter(engine, selfGroup.Group("", middleware.UserCriticalRateLimit("security-verification"), middleware.DisableCache()), "2FA", secDashboard())
+		self2FA.GinGet("/2fa/status", controller.Get2FAStatus, dto.GinResp[dto.Response[dto.TwoFAStatusData]]())
+		self2FAEnroll.GinPost("/2fa/setup", controller.Setup2FA, dto.GinResp[dto.Response[dto.Setup2FAResponse]]())
+		self2FAEnroll.GinPost("/2fa/enable", controller.Enable2FA, dto.GinResp[dto.Response[dto.AuthRotationData]](), dto.GinBody[dto.Verify2FARequest]())
+		self2FA.GinPost("/2fa/disable", controller.Disable2FA, dto.GinResp[dto.Response[dto.AuthRotationData]]())
+		self2FA.GinPost("/2fa/backup_codes", controller.RegenerateBackupCodes, dto.GinResp[dto.Response[dto.BackupCodesData]]())
+
+		// Check-in routes
+		selfCheckin := dto.NewRouter(engine, selfGroup, "Checkin", secDashboard())
+		dto.GetP(selfCheckin, "/checkin", controller.GetCheckinStatus)
+		selfCheckinTurnstile := dto.NewRouter(engine, selfGroup.Group("", middleware.TurnstileCheck()), "Checkin", secDashboard())
+		dto.Post(selfCheckinTurnstile, "/checkin", controller.DoCheckin, dto.TurnstileQuery())
+
+		// Custom OAuth bindings
+		selfOAuth := dto.NewRouter(engine, selfGroup, "OAuth", secDashboard())
+		selfOAuthCred := dto.NewRouter(engine, selfGroup.Group("", middleware.SessionOnly()), "OAuth", secDashboard())
+		dto.Get(selfOAuth, "/oauth/bindings", controller.GetUserOAuthBindings)
+		selfOAuthCred.GinDelete("/oauth/bindings/:provider_id", controller.UnbindCustomOAuth, option.Path("provider_id", "OAuth provider ID"), dto.GinResp[dto.ApiResponse]())
+		dto.Delete(selfOAuthCred, "/bindings/:binding_type", controller.SelfClearBinding, option.Path("binding_type", "Binding type (github, discord, google, oidc, wechat, telegram, linuxdo)"))
+
+		// Admin user routes
+		adminGroup := userGroup.Group("", middleware.AdminAuth())
+		admin := dto.NewRouter(engine, adminGroup, "AdminUser", secDashboard())
+		adminMoney := dto.NewRouter(engine, userGroup.Group("", middleware.AdminAuth(), middleware.NoPAT()), "AdminUser", secDashboard())
+		// Read-only user views a Moderator may also see (list/search/detail).
+		modReadGroup := userGroup.Group("", middleware.ModAuth())
+		adminRead := dto.NewRouter(engine, modReadGroup, "AdminUser", secDashboard())
+		dto.Get(adminRead, "/", controller.GetAllUsers, dto.PageParams())
+		dto.GetP(admin, "/topup", controller.GetAllTopUps, dto.PageParams())
+		dto.PostB(adminMoney, "/topup/complete", controller.AdminCompleteTopUp)
+		dto.GetP(adminRead, "/search", controller.SearchUsers, dto.PageParams())
+		dto.Get(adminRead, "/:id", controller.GetUser, option.Path("id", "User ID"))
+		dto.Get(admin, "/:id/oauth/bindings", controller.GetUserOAuthBindingsByAdmin, option.Path("id", "User ID"))
+
+		// Routes the Discord bot needs. BotAuth accepts its service token and
+		// otherwise falls through to AdminAuth, so the dashboard is unchanged.
+		// Registered HERE rather than alongside the admin group above because gin
+		// panics on a duplicate method+path pair.
+		botOrAdminGroup := userGroup.Group("", middleware.BotAuth(), middleware.NoPAT())
+		botOrAdmin := dto.NewRouter(engine, botOrAdminGroup, "AdminUser", secDashboard())
+		// ManageUser restricts a bot-authenticated caller to one action; every
+		// other action stays admin-only.
+		dto.PostB(botOrAdmin, "/manage", controller.ManageUser)
+		dto.PostB(botOrAdmin, "/discord_grant", controller.GrantDiscordQuota)
+		dto.PostB(botOrAdmin, "/discord_transfer", controller.TransferDiscordQuota)
+		// Reduced read. The bot uses this instead of /:id so its token never sees
+		// the email, Discord id or register IP on the full record.
+		dto.Get(botOrAdmin, "/:id/bot_view", controller.GetUserBotView, option.Path("id", "User ID"))
+		// Routes that rewrite the credentials guarding an account. A personal
+		// access token is a bearer secret with no second factor, so letting one
+		// reset a password or strip 2FA means the weakest credential can disable
+		// the strongest -- which is exactly the move that took root on 2026-08-26.
+		// These require an interactive session; automation that legitimately needs
+		// them should drive the dashboard, not a PAT.
+		adminCred := dto.NewRouter(engine, userGroup.Group("", middleware.AdminAuth(), middleware.SessionOnly()), "AdminUser", secDashboard())
+		dto.PutB(adminCred, "/", controller.UpdateUser)
+		adminCred.GinDelete("/:id/reset_passkey", controller.AdminResetPasskey, option.Path("id", "User ID"), dto.GinResp[dto.ApiResponse]())
+		// CreateUser takes an attacker-chosen username, password and role, so a PAT
+		// reaching it mints a fresh admin account and logs in interactively -- the
+		// whole control, walked around in one request.
+		dto.PostB(adminCred, "/", controller.CreateUser)
+		dto.Delete(adminCred, "/:id", controller.DeleteUser, option.Path("id", "User ID"))
+		// Detaching an identity frees it to be re-attached elsewhere, so it changes
+		// what can log in as this account.
+		dto.Delete(adminCred, "/:id/oauth/bindings/:provider_id", controller.UnbindCustomOAuthByAdmin, option.Path("id", "User ID"), option.Path("provider_id", "OAuth provider ID"))
+		dto.Delete(adminCred, "/:id/bindings/:binding_type", controller.AdminClearUserBinding, option.Path("id", "User ID"), option.Path("binding_type", "Binding type"))
+
+		// Admin 2FA routes
+		admin2FA := admin.WithTag("Admin2FA")
+		admin2FA.GinGet("/2fa/stats", controller.Admin2FAStats, dto.GinResp[dto.ApiResponse]())
+		admin2FACred := dto.NewRouter(engine, userGroup.Group("", middleware.AdminAuth(), middleware.SessionOnly()), "Admin2FA", secDashboard())
+		admin2FACred.GinDelete("/:id/2fa", controller.AdminDisable2FA, option.Path("id", "User ID"), dto.GinResp[dto.ApiResponse]())
+
+		// ---- Subscription routes ----
+		subGroup := apiRouter.Group("/subscription", middleware.UserAuth())
+		sub := dto.NewRouter(engine, subGroup, "Subscription", secDashboard())
+		// The plan catalog is the same for everyone and is what the public pricing
+		// page renders, so it carries no user context and needs no session.
+		subPublic := dto.NewRouter(engine, apiRouter.Group("/subscription", middleware.TryUserAuth()), "Subscription", secPublic())
+		dto.Get(subPublic, "/plans", controller.GetSubscriptionPlans)
+
+		// Reads gated by `subscription:read` for OAuth agents; humans pass.
+		subRead := dto.NewRouter(engine, subGroup.Group("", middleware.RequireScope("subscription:read")), "Subscription", secDashboard())
+		dto.Get(subRead, "/self", controller.GetSubscriptionSelf)
+		dto.GetP(subRead, "/orders/self", controller.GetUserSubscriptionOrders, dto.PageParams())
+		dto.PutB(sub, "/self/preference", controller.UpdateSubscriptionPreference)
+
+		subCritical := dto.NewRouter(engine, subGroup.Group("", middleware.CriticalRateLimit(), middleware.RequireScope("checkout:create")), "SubscriptionPayment", secDashboard())
+		dto.PostB(subCritical, "/epay/pay", controller.SubscriptionRequestEpay)
+		dto.PostB(subCritical, "/stripe/pay", controller.SubscriptionRequestStripePay)
+		dto.PostB(subCritical, "/creem/pay", controller.SubscriptionRequestCreemPay)
+		dto.PostB(subCritical, "/nowpayments/pay", controller.SubscriptionRequestNowPaymentsPay)
+		dto.PostB(subCritical, "/delopay/pay", controller.SubscriptionRequestDeloPayPay)
+		dto.PostB(subCritical, "/balance/pay", controller.SubscriptionRequestBalancePay)
+		subCritical.GinPost("/waffo-pancake/pay", controller.SubscriptionRequestWaffoPancakePay, dto.GinResp[dto.ApiResponse]())
+
+		subAdminGroup := apiRouter.Group("/subscription/admin", middleware.AdminAuth(), middleware.NoPAT())
+		subAdmin := dto.NewRouter(engine, subAdminGroup, "AdminSubscription", secDashboard())
+		dto.Get(subAdmin, "/plans", controller.AdminListSubscriptionPlans)
+		dto.PostB(subAdmin, "/plans", controller.AdminCreateSubscriptionPlan)
+		dto.PutB(subAdmin, "/plans/:id", controller.AdminUpdateSubscriptionPlan, option.Path("id", "Plan ID"))
+		dto.PatchB(subAdmin, "/plans/:id", controller.AdminUpdateSubscriptionPlanStatus, option.Path("id", "Plan ID"))
+		dto.PostB(subAdmin, "/plans/:id/subscriptions/reset", controller.AdminResetPlanSubscriptions, option.Path("id", "Plan ID"))
+		dto.PostB(subAdmin, "/bind", controller.AdminBindSubscription)
+		dto.Get(subAdmin, "/users/:id/subscriptions", controller.AdminListUserSubscriptions, option.Path("id", "User ID"))
+		dto.PostB(subAdmin, "/users/:id/subscriptions", controller.AdminCreateUserSubscription, option.Path("id", "User ID"))
+		dto.PostB(subAdmin, "/users/:id/subscriptions/reset", controller.AdminResetUserSubscriptionsByPlan, option.Path("id", "User ID"))
+		dto.Post(subAdmin, "/user_subscriptions/:id/invalidate", controller.AdminInvalidateUserSubscription, option.Path("id", "Subscription ID"))
+		dto.Delete(subAdmin, "/user_subscriptions/:id", controller.AdminDeleteUserSubscription, option.Path("id", "Subscription ID"))
+
+		// Subscription payment callbacks (no auth, stay as *gin.Context -- raw writer/redirect)
+		subPaymentPublic := dto.NewRouter(engine, apiRouter, "SubscriptionPayment", secPublic())
+		subPaymentPublic.GinPost("/subscription/epay/notify", controller.SubscriptionEpayNotify, dto.GinResp[dto.MessageResponse]())
+		subPaymentPublic.GinGet("/subscription/epay/notify", controller.SubscriptionEpayNotify, dto.GinResp[dto.MessageResponse]())
+		subPaymentPublic.GinGet("/subscription/epay/return", controller.SubscriptionEpayReturn, dto.GinResp[dto.MessageResponse]())
+		subPaymentPublic.GinPost("/subscription/epay/return", controller.SubscriptionEpayReturn, dto.GinResp[dto.MessageResponse]())
+
+		// ---- Option routes (root only) ----
+		// The sync reads and writes the options collection and nothing else, so only
+		// those two routes carry SyncAuth. It used to sit on the whole group, which
+		// let the service token reach ten further root handlers -- including the
+		// Waffo payment-product writes -- because syncAllowedOptionKeys is enforced
+		// inside UpdateOption and gates nothing else on the group.
+		optionSyncGroup := apiRouter.Group("/option", middleware.SyncAuth(common.RoleRootUser), middleware.NoPAT())
+		optSync := dto.NewRouter(engine, optionSyncGroup, "Option", secDashboard())
+		dto.Get(optSync, "/", controller.GetOptions)
+		dto.PutB(optSync, "/", controller.UpdateOption)
+
+		optionGroup := apiRouter.Group("/option", middleware.RootAuth(), middleware.NoPAT())
+		opt := dto.NewRouter(engine, optionGroup, "Option", secDashboard())
+		// Per-model pricing editor (expression pricing), raw gin like upstream.
+		optionGroup.GET("/model_pricing", controller.GetModelPricingConfig)
+		optionGroup.PATCH("/model_pricing", controller.UpdateModelPricingConfig)
+		optionGroup.POST("/model_pricing/convert", controller.PreviewModelPricingConversion)
+		optionGroup.POST("/model_pricing/preview", controller.PreviewModelPricing)
+		// Request policies (upstream 2026-09), raw gin like upstream.
+		optionGroup.GET("/request_policy", controller.GetRequestPolicy)
+		optionGroup.PATCH("/request_policy", controller.UpdateRequestPolicy)
+		optionGroup.PUT("/passkey/domains", controller.UpdatePasskeyDomains)
+		dto.Get(opt, "/channel_affinity_cache", controller.GetChannelAffinityCacheStats)
+		dto.DeleteP(opt, "/channel_affinity_cache", controller.ClearChannelAffinityCache)
+		dto.Post(opt, "/rest_model_ratio", controller.ResetModelRatio)
+		dto.Post(opt, "/migrate_console_setting", controller.MigrateConsoleSetting)
+		opt.GinPost("/payment_compliance", controller.ConfirmPaymentCompliance, dto.GinResp[dto.ApiResponse](), dto.GinBody[controller.PaymentComplianceRequest]())
+		opt.GinPost("/waffo-pancake/subscription-product", controller.CreateWaffoPancakeSubscriptionProduct, dto.GinResp[dto.ApiResponse]())
+		opt.GinGet("/waffo-pancake/subscription-product-options", controller.ListWaffoPancakeSubscriptionProductOptions, dto.GinResp[dto.ApiResponse]())
+		opt.GinGet("/waffo-pancake/catalog", controller.ListWaffoPancakeCatalog, dto.GinResp[dto.ApiResponse]())
+		opt.GinPost("/waffo-pancake/pair", controller.CreateWaffoPancakePair, dto.GinResp[dto.ApiResponse]())
+		opt.GinPost("/waffo-pancake/save", controller.SaveWaffoPancake, dto.GinResp[dto.ApiResponse]())
+
+		// ---- Custom OAuth provider management (root only) ----
+		customOAuthGroup := apiRouter.Group("/custom-oauth-provider", middleware.RootAuth(), middleware.NoPAT())
+		customOAuth := dto.NewRouter(engine, customOAuthGroup, "CustomOAuth", secDashboard())
+		dto.PostB(customOAuth, "/discovery", controller.FetchCustomOAuthDiscovery)
+		dto.Get(customOAuth, "/", controller.GetCustomOAuthProviders)
+		dto.Get(customOAuth, "/:id", controller.GetCustomOAuthProvider, option.Path("id", "Provider ID"))
+		dto.PostB(customOAuth, "/", controller.CreateCustomOAuthProvider)
+		dto.PutB(customOAuth, "/:id", controller.UpdateCustomOAuthProvider, option.Path("id", "Provider ID"))
+		dto.Delete(customOAuth, "/:id", controller.DeleteCustomOAuthProvider, option.Path("id", "Provider ID"))
+
+		// ---- Performance routes (root only) ----
+		perfGroup := apiRouter.Group("/performance", middleware.RootAuth(), middleware.NoPAT())
+		perf := dto.NewRouter(engine, perfGroup, "Performance", secDashboard())
+		dto.Get(perf, "/stats", controller.GetPerformanceStats)
+		dto.Delete(perf, "/disk_cache", controller.ClearDiskCache)
+		dto.Post(perf, "/reset_stats", controller.ResetPerformanceStats)
+		dto.Post(perf, "/gc", controller.ForceGC)
+		dto.Get(perf, "/logs", controller.GetLogFiles)
+		dto.Delete(perf, "/logs", controller.CleanupLogFiles)
+
+		// ---- Ratio sync routes (root only) ----
+		ratioSyncGroup := apiRouter.Group("/ratio_sync", middleware.RootAuth(), middleware.NoPAT())
+		ratioSync := dto.NewRouter(engine, ratioSyncGroup, "RatioSync", secDashboard())
+		dto.Get(ratioSync, "/channels", controller.GetSyncableChannels)
+		dto.PostB(ratioSync, "/fetch", controller.FetchUpstreamRatios)
+
+		// ---- System maintenance routes (root only) ----
+		systemTaskGroup := apiRouter.Group("/system-task", middleware.RootAuth())
+		// Log cleanup runs an unqualified DELETE over the audit table every security
+		// alert reads, so a single call both destroys the evidence and silences the
+		// detection built on it. It is the one route where a bearer secret alone
+		// must not be enough.
+		systemTaskGroup.POST("/log-cleanup", middleware.SessionOnly(), controller.CreateLogCleanupSystemTask)
+		systemTaskGroup.GET("/current", controller.GetCurrentSystemTask)
+		systemTaskGroup.GET("/list", controller.ListSystemTasks)
+		systemTaskGroup.DELETE("/history", middleware.SessionOnly(), controller.DeleteSystemTaskHistory)
+		systemTaskGroup.GET("/:task_id", controller.GetSystemTask)
+
+		systemInfoGroup := apiRouter.Group("/system-info", middleware.RootAuth(), middleware.NoPAT())
+		systemInfoGroup.GET("/instances", controller.ListSystemInstances)
+		systemInfoGroup.DELETE("/stale-instances", controller.DeleteStaleSystemInstances)
+		systemInfoGroup.DELETE("/instances/:node_name", controller.DeleteStaleSystemInstance)
+
+		registerAuthzRoutes(apiRouter)
+
+		// ---- Channel routes (admin) ----
+		// AdminAuth only proves the caller is an admin; the per-route permission
+		// is what separates a read-only operator from someone who may rewrite a
+		// channel's key or base_url. Each route sits in the subgroup matching the
+		// permission it required before, so a restricted admin cannot reach a
+		// sensitive write by virtue of being an admin at all.
+		channelGroup := apiRouter.Group("/channel", middleware.SyncAuth(common.RoleAdminUser))
+		chReadG := newPermissionGroup(channelGroup, authz.ChannelRead)
+		chOpG := newPermissionGroup(channelGroup, authz.ChannelOperate, middleware.NoPAT())
+		chWriteG := newPermissionGroup(channelGroup, authz.ChannelWrite, middleware.NoPAT())
+		chSensG := newPermissionGroup(channelGroup, authz.ChannelSensitiveWrite, middleware.NoPAT())
+
+		chReadG.GET("/default_base_urls", controller.GetChannelDefaultBaseURLs)
+		chReadG.GET("/:id/vllm/status", controller.GetVLLMChannelStatus)
+		chReadG.GET("/:id/sglang/status", controller.GetSGLangChannelStatus)
+		chReadG.GET("/priority/order", controller.GetChannelPriorityOrder)
+		chWriteG.POST("/priority/reorder", controller.ReorderChannelPriority)
+
+		ch := dto.NewRouter(engine, chReadG, "Channel", secDashboard())
+		chOp := dto.NewRouter(engine, chOpG, "Channel", secDashboard())
+		chWrite := dto.NewRouter(engine, chWriteG, "Channel", secDashboard())
+		chSens := dto.NewRouter(engine, chSensG, "Channel", secDashboard())
+
+		dto.GetP(ch, "/", controller.GetAllChannels, dto.PageParams())
+		dto.GetP(ch, "/search", controller.SearchChannels, dto.PageParams())
+		dto.Get(ch, "/models", controller.ChannelListModels)
+		dto.Get(ch, "/models_enabled", controller.EnabledListModels)
+		ch.GinGet("/ops", controller.GetChannelOps, dto.GinResp[dto.ApiResponse]())
+		dto.Get(ch, "/:id", controller.GetChannel, option.Path("id", "Channel ID"))
+		dto.Get(chOp, "/test", controller.TestAllChannels)
+		dto.GetP(chOp, "/test/:id", controller.TestChannel, option.Path("id", "Channel ID"))
+		dto.Get(chOp, "/update_balance", controller.UpdateAllChannelsBalance)
+		dto.Get(chOp, "/update_balance/:id", controller.UpdateChannelBalance, option.Path("id", "Channel ID"))
+		dto.PostB(chSens, "/", controller.AddChannel)
+		dto.PutB(chWrite, "/", controller.UpdateChannel)
+		dto.Delete(chSens, "/disabled", controller.DeleteDisabledChannel)
+		dto.PostB(chOp, "/tag/disabled", controller.DisableTagChannels)
+		dto.PostB(chOp, "/tag/enabled", controller.EnableTagChannels)
+		dto.PutB(chWrite, "/tag", controller.EditTagChannels)
+		dto.Delete(chSens, "/:id", controller.DeleteChannel, option.Path("id", "Channel ID"))
+		dto.PostB(chSens, "/batch", controller.DeleteChannelBatch)
+		dto.Post(chOp, "/fix", controller.FixChannelsAbilities)
+		dto.Delete(chSens, "/orphaned-abilities", controller.DeleteOrphanedAbilities)
+		dto.Get(chOp, "/fetch_models/:id", controller.FetchUpstreamModels, option.Path("id", "Channel ID"), dto.Resp[dto.ApiResponse]())
+		dto.PostB(chSens, "/fetch_models", controller.FetchModels)
+		dto.Post(chSens, "/codex/oauth/start", controller.StartCodexOAuth)
+		dto.PostB(chSens, "/codex/oauth/complete", controller.CompleteCodexOAuth)
+		dto.Post(chSens, "/:id/codex/oauth/start", controller.StartCodexOAuthForChannel, option.Path("id", "Channel ID"))
+		dto.PostB(chSens, "/:id/codex/oauth/complete", controller.CompleteCodexOAuthForChannel, option.Path("id", "Channel ID"))
+		dto.Post(chSens, "/:id/codex/refresh", controller.RefreshCodexChannelCredential, option.Path("id", "Channel ID"))
+		dto.Get(ch, "/:id/codex/usage", controller.GetCodexChannelUsage, option.Path("id", "Channel ID"))
+		dto.Get(ch, "/:id/codex/usage/reset-credits", controller.GetCodexChannelRateLimitResetCredits, option.Path("id", "Channel ID"))
+		dto.Post(chOp, "/:id/codex/usage/reset", controller.ResetCodexChannelUsage, option.Path("id", "Channel ID"))
+		dto.PostB(chSens, "/ollama/pull", controller.OllamaPullModel)
+		chSens.GinPost("/ollama/pull/stream", controller.OllamaPullModelStream, dto.GinResp[dto.MessageResponse]())
+		dto.DeleteB(chSens, "/ollama/delete", controller.OllamaDeleteModel)
+		dto.Get(chSens, "/ollama/version/:id", controller.OllamaVersion, option.Path("id", "Channel ID"))
+		dto.PostB(chWrite, "/batch/tag", controller.BatchSetChannelTag)
+		dto.GetP(ch, "/tag/models", controller.GetTagModels)
+		dto.DeleteP(chOp, "/diagnostics", controller.PruneChannelDiagnostics)
+		dto.PostP(chSens, "/copy/:id", controller.CopyChannel, option.Path("id", "Channel ID"))
+		dto.PostB(chOp, "/multi_key/manage", controller.ManageMultiKeys, dto.Resp[dto.MultiKeyStatusResponse]())
+		chWrite.GinPost("/upstream_updates/apply", controller.ApplyChannelUpstreamModelUpdates, dto.GinResp[dto.MessageResponse]())
+		chWrite.GinPost("/upstream_updates/apply_all", controller.ApplyAllChannelUpstreamModelUpdates, dto.GinResp[dto.MessageResponse]())
+		chOp.GinPost("/upstream_updates/detect", controller.DetectChannelUpstreamModelUpdates, dto.GinResp[dto.MessageResponse]())
+		chOp.GinPost("/upstream_updates/detect_all", controller.DetectAllChannelUpstreamModelUpdates, dto.GinResp[dto.MessageResponse]())
+
+		// Channel key route (root + extra middleware)
+		chKey := dto.NewRouter(engine, channelGroup.Group("", middleware.RootAuth(), middleware.CriticalRateLimit(), middleware.DisableCache(), middleware.SecureVerificationRequired()), "Channel", secDashboard())
+		dto.Post(chKey, "/:id/key", controller.GetChannelKey, option.Path("id", "Channel ID"))
+
+		// Channel diagnostics reads: separate /channel group gated at Moderator level
+		// (the main channelGroup stacks AdminAuth, which would reject a Moderator).
+		chDiagMod := dto.NewRouter(engine, apiRouter.Group("/channel", middleware.ModAuth()), "Channel", secDashboard())
+		dto.GetP(chDiagMod, "/diagnostics", controller.GetChannelDiagnostics, dto.PageParams())
+		dto.GetP(chDiagMod, "/diagnostics/stats", controller.GetChannelDiagnosticStats)
+		dto.GetP(chDiagMod, "/diagnostics/prompt_capacity", controller.GetLanePromptCapacity)
+
+		// ---- Model status routes (admin) ----
+		// components, buckets and page_compact are registered public above; only
+		// incidents stays admin, since nothing public renders it.
+		modelStatusGroup := apiRouter.Group("/model_status", middleware.AdminAuth(), middleware.NoPAT())
+		ms := dto.NewRouter(engine, modelStatusGroup, "ModelStatus", secDashboard())
+		dto.GetP(ms, "/incidents", controller.GetModelStatusIncidents)
+
+		// The sync refreshes the guest key's model_limits and touches nothing else
+		// about tokens, so it gets one route of its own rather than a seat in the
+		// user-auth token group. The handler re-checks the credential.
+		tokenSyncGroup := apiRouter.Group("/token", middleware.SyncAuth(common.RoleAdminUser), middleware.NoPAT())
+		tokSync := dto.NewRouter(engine, tokenSyncGroup, "Token", secDashboard())
+		dto.PutB(tokSync, "/guest-model-limits", controller.UpdateGuestTokenModelLimits)
+
+		// ---- Token routes (user auth) ----
+		tokenGroup := apiRouter.Group("/token", middleware.UserAuth())
+		// Reads are gated by `tokens:read` when the caller is an OAuth agent;
+		// RequireScope is a no-op for session / access-token humans.
+		tokRead := dto.NewRouter(engine, tokenGroup.Group("", middleware.RequireScope("tokens:read")), "Token", secDashboard())
+		dto.Get(tokRead, "/", controller.GetAllTokens, dto.PageParams())
+		dto.Get(tokRead, "/auto-groups", controller.GetTokenAutoGroups)
+		dto.Get(tokRead, "/:id", controller.GetToken, option.Path("id", "Token ID"))
+		// Writes are gated by `tokens:write`.
+		tokWrite := dto.NewRouter(engine, tokenGroup.Group("", middleware.RequireScope("tokens:write"), middleware.NoPATForPrivileged()), "Token", secDashboard())
+		dto.PostB(tokWrite, "/", controller.AddToken)
+		dto.PutBP(tokWrite, "/", controller.UpdateToken)
+		dto.Delete(tokWrite, "/:id", controller.DeleteToken, option.Path("id", "Token ID"))
+		dto.PostB(tokWrite, "/batch", controller.DeleteTokenBatch)
+
+		// /:id/key reveals the secret of an API key — gated by tokens:read.
+		tokKey := dto.NewRouter(engine, tokenGroup.Group("", middleware.RequireScope("tokens:read"), middleware.NoPATForPrivileged(), middleware.CriticalRateLimit(), middleware.DisableCache()), "Token", secDashboard())
+		dto.Post(tokKey, "/:id/key", controller.GetTokenKey, option.Path("id", "Token ID"))
+		tokKey.GinPost("/batch/keys", controller.GetTokenKeysBatch, dto.GinResp[dto.ApiResponse]())
+
+		tokSearch := dto.NewRouter(engine, tokenGroup.Group("", middleware.RequireScope("tokens:read"), middleware.SearchRateLimit()), "Token", secDashboard())
+		dto.GetP(tokSearch, "/search", controller.SearchTokens, dto.PageParams())
+
+		// ---- Usage routes ----
+		usageTokenGroup := apiRouter.Group("/usage/token", middleware.CORS(), middleware.CriticalRateLimit(), middleware.TokenAuthReadOnly())
+		usageTok := dto.NewRouter(engine, usageTokenGroup, "Usage", secToken())
+		dto.Get(usageTok, "/", controller.GetTokenUsage)
+
+		// ---- Redemption routes (admin) ----
+		redemptionGroup := apiRouter.Group("/redemption", middleware.AdminAuth(), middleware.NoPAT())
+		redemption := dto.NewRouter(engine, redemptionGroup, "Redemption", secDashboard())
+		redemption.GinPost("/batch", controller.DeleteRedemptionBatch, dto.GinResp[dto.ApiResponse]())
+		dto.Get(redemption, "/", controller.GetAllRedemptions, dto.PageParams())
+		dto.GetP(redemption, "/search", controller.SearchRedemptions, dto.PageParams())
+		dto.Get(redemption, "/:id", controller.GetRedemption, option.Path("id", "Redemption ID"))
+		dto.PostB(redemption, "/", controller.AddRedemption)
+		dto.PutBP(redemption, "/", controller.UpdateRedemption)
+		dto.Delete(redemption, "/invalid", controller.DeleteInvalidRedemption)
+		dto.Delete(redemption, "/:id", controller.DeleteRedemption, option.Path("id", "Redemption ID"))
+
+		// ---- Log routes ----
+		logGroup := apiRouter.Group("/log")
+
+		logAdmin := dto.NewRouter(engine, logGroup.Group("", middleware.AdminAuth(), middleware.NoPAT()), "Log", secDashboard())
+		logMod := dto.NewRouter(engine, logGroup.Group("", middleware.ModAuth()), "Log", secDashboard())
+		dto.GetP(logMod, "/", controller.GetAllLogs, dto.PageParams())
+		dto.DeleteP(logAdmin, "/", controller.DeleteHistoryLogs)
+		dto.GetP(logMod, "/stat", controller.GetLogsStat)
+		dto.GetP(logMod, "/channel_affinity_usage_cache", controller.GetChannelAffinityUsageCacheStats)
+		dto.Get(logMod, "/search", controller.SearchAllLogs)
+		// Moderators read every log, so they export too; a bulk dump never runs on a PAT.
+		logExport := dto.NewRouter(engine, logGroup.Group("", middleware.ModAuth(), middleware.NoPAT()), "Log", secDashboard())
+		logExport.GinGet("/export", controller.ExportAllLogs, dto.GinResp[dto.ApiResponse]())
+
+		logUser := dto.NewRouter(engine, logGroup.Group("", middleware.UserAuth()), "Log", secDashboard())
+		dto.GetP(logUser, "/self/stat", controller.GetLogsSelfStat)
+		dto.GetP(logUser, "/self", controller.GetUserLogs, dto.PageParams())
+		logUser.GinGet("/self/export", controller.ExportUserLogs, dto.GinResp[dto.ApiResponse]())
+
+		logUserSearch := dto.NewRouter(engine, logGroup.Group("", middleware.UserAuth(), middleware.SearchRateLimit()), "Log", secDashboard())
+		dto.Get(logUserSearch, "/self/search", controller.SearchUserLogs)
+
+		logToken := dto.NewRouter(engine, logGroup.Group("", middleware.CORS(), middleware.CriticalRateLimit(), middleware.TokenAuthReadOnly()), "Log", secToken())
+		dto.Get(logToken, "/token", controller.GetLogByKey)
+
+		// ---- Data routes ----
+		dataAdmin := dto.NewRouter(engine, apiRouter.Group("/data", middleware.ModAuth()), "Data", secDashboard())
+		dto.GetP(dataAdmin, "/", controller.GetAllQuotaDates)
+		dto.GetP(dataAdmin, "/flow", controller.GetFlowQuotaDates)
+
+		dataUser := dto.NewRouter(engine, apiRouter.Group("/data", middleware.UserAuth()), "Data", secDashboard())
+		dto.GetP(dataUser, "/self", controller.GetUserQuotaDates)
+		dto.GetP(dataUser, "/flow/self", controller.GetUserFlowQuotaDates)
+
+		// ---- Group routes ----
+		// Mods can view the user list, which needs the group list for the Group
+		// column/filter, so the read-only group list is Mod-gated (not Admin).
+		grp := dto.NewRouter(engine, apiRouter.Group("/group", middleware.ModAuth()), "Group", secDashboard())
+		dto.Get(grp, "/", controller.GetGroups)
+
+		// ---- Prefill group routes (admin) ----
+		prefillGrp := dto.NewRouter(engine, apiRouter.Group("/prefill_group", middleware.AdminAuth(), middleware.NoPAT()), "PrefillGroup", secDashboard())
+		dto.GetP(prefillGrp, "/", controller.GetPrefillGroups)
+		dto.PostB(prefillGrp, "/", controller.CreatePrefillGroup)
+		dto.PutB(prefillGrp, "/", controller.UpdatePrefillGroup)
+		dto.Delete(prefillGrp, "/:id", controller.DeletePrefillGroup, option.Path("id", "Prefill group ID"))
+
+		// ---- Midjourney routes ----
+		mjGroup := apiRouter.Group("/mj")
+		mjUser := dto.NewRouter(engine, mjGroup.Group("", middleware.UserAuth()), "Midjourney", secDashboard())
+		dto.GetP(mjUser, "/self", controller.GetUserMidjourney, dto.PageParams())
+		mjAdmin := dto.NewRouter(engine, mjGroup.Group("", middleware.AdminAuth()), "Midjourney", secDashboard())
+		dto.GetP(mjAdmin, "/", controller.GetAllMidjourney, dto.PageParams())
+
+		// ---- Task routes ----
+		taskGroup := apiRouter.Group("/task")
+		taskUser := dto.NewRouter(engine, taskGroup.Group("", middleware.UserAuth()), "Task", secDashboard())
+		dto.GetP(taskUser, "/self", controller.GetUserTask, dto.PageParams())
+		taskAdmin := dto.NewRouter(engine, taskGroup.Group("", middleware.ModAuth()), "Task", secDashboard())
+		dto.GetP(taskAdmin, "/", controller.GetAllTask, dto.PageParams())
+		taskGroup.GET("/:task_id/artifacts", middleware.UserAuth(), controller.GetDashboardTaskArtifacts)
+
+		// ---- Task plugin routes (upstream; handlers are plain gin) ----
+		taskPluginRoute := apiRouter.Group("/plugin/task", middleware.RootAuth(), middleware.NoPAT())
+		{
+			taskPluginRoute.GET("", controller.ListTaskPlugins)
+			taskPluginRoute.POST("", controller.UploadTaskPlugin)
+			taskPluginRoute.PUT("", controller.UploadTaskPlugin)
+			taskPluginRoute.GET("/runtime/status", controller.GetTaskPluginRuntime)
+			taskPluginRoute.GET("/marketplace/sources", controller.GetTaskPluginMarketplaceSources)
+			taskPluginRoute.PUT("/marketplace/sources", controller.UpdateTaskPluginMarketplaceSources)
+			taskPluginRoute.GET("/:key", controller.GetTaskPlugin)
+			taskPluginRoute.GET("/:key/versions", controller.GetTaskPluginVersions)
+			taskPluginRoute.POST("/:key/activate", controller.ActivateTaskPlugin)
+			taskPluginRoute.POST("/:key/status", controller.SetTaskPluginStatus)
+			taskPluginRoute.POST("/:key/dryrun", controller.DryRunTaskPlugin)
+			taskPluginRoute.DELETE("/:key/versions/:version", controller.DeleteTaskPluginVersion)
+		}
+		middleware.DeclareAccessTokenPermissionRoute("GET", "/api/task_plugin_options", authz.TaskPluginBind)
+		apiRouter.GET("/task_plugin_options", middleware.AdminAuth(), middleware.RequirePermission(authz.TaskPluginBind), controller.GetTaskPluginOptions)
+		taskPluginRoute.GET("/:key/icon", controller.GetTaskPluginIcon)
+		// Audit log reads: moderators and admins holding the audit permission see
+		// everything but root, a user sees their own rows.
+		middleware.DeclareAccessTokenPermissionRoute("GET", "/api/audit", authz.AuditRead)
+		apiRouter.GET("/audit", middleware.DisableCache(), middleware.ModAuth(), middleware.RequirePermission(authz.AuditRead), controller.GetAuditLogs)
+		apiRouter.GET("/audit/self", middleware.DisableCache(), middleware.UserAuth(), controller.GetAuditLogs)
+
+		// ---- Vendor routes (admin) ----
+		vendorGroup := apiRouter.Group("/vendors", middleware.SyncAuth(common.RoleAdminUser), middleware.NoPAT())
+		vendor := dto.NewRouter(engine, vendorGroup, "Vendor", secDashboard())
+		vendor.GinGet("/", controller.GetAllVendors, dto.PageParams(), dto.GinResp[dto.ApiResponse]())
+		vendor.GinGet("/search", controller.SearchVendors, dto.PageParams(), dto.GinResp[dto.ApiResponse]())
+		vendor.GinGet("/:id", controller.GetVendorMeta, option.Path("id", "Vendor ID"), dto.GinResp[dto.ApiResponse]())
+		vendor.GinPost("/", controller.CreateVendorMeta, dto.GinResp[dto.ApiResponse]())
+		vendor.GinPut("/", controller.UpdateVendorMeta, dto.GinResp[dto.ApiResponse]())
+		vendor.GinDelete("/:id", controller.DeleteVendorMeta, option.Path("id", "Vendor ID"), dto.GinResp[dto.ApiResponse]())
+		vendor.GinPost("/operations/preview", controller.PreviewVendorOperation, dto.GinResp[dto.ApiResponse]())
+		vendor.GinPost("/operations", controller.ApplyVendorOperation, dto.GinResp[dto.ApiResponse]())
+
+		// ---- Models routes (admin) ----
+		modelsGroup := apiRouter.Group("/models", middleware.SyncAuth(common.RoleAdminUser), middleware.NoPAT())
+		models := dto.NewRouter(engine, modelsGroup, "ModelMeta", secDashboard())
+		models.GinGet("/sync_upstream/preview", controller.SyncUpstreamPreview, dto.GinResp[dto.ApiResponse]())
+		models.GinPost("/sync_upstream", controller.SyncUpstreamModels, dto.GinResp[dto.ApiResponse]())
+		models.GinPost("/delete", controller.BatchDeleteModelMeta, dto.GinResp[dto.ApiResponse]())
+		dto.Get(models, "/missing", controller.GetMissingModels)
+		// /list is prod's alias for the paged admin list: gin 301s "/models/" to
+		// the public dashboard list, which the sync credential cannot pass.
+		models.GinGet("/list", controller.GetAllModelsMeta, dto.PageParams(), dto.GinResp[dto.ApiResponse]())
+		models.GinGet("/search", controller.SearchModelsMeta, dto.PageParams(), dto.GinResp[dto.ApiResponse]())
+		models.GinGet("/:id", controller.GetModelMeta, option.Path("id", "Model ID"), dto.GinResp[dto.ApiResponse]())
+		models.GinPost("/", controller.CreateModelMeta, dto.GinResp[dto.ApiResponse]())
+		models.GinPut("/", controller.UpdateModelMeta, dto.GinResp[dto.ApiResponse]())
+		models.GinDelete("/orphaned", controller.DeleteOrphanedModels, dto.GinResp[dto.ApiResponse]())
+		models.GinDelete("/:id", controller.DeleteModelMeta, option.Path("id", "Model ID"), dto.GinResp[dto.ApiResponse]())
+
+		// ---- Deployment routes (admin) ----
+		deploymentsGroup := apiRouter.Group("/deployments", middleware.AdminAuth(), middleware.NoPAT())
+		deploy := dto.NewRouter(engine, deploymentsGroup, "Deployment", secDashboard())
+		dto.Get(deploy, "/settings", controller.GetModelDeploymentSettings)
+		dto.PostB(deploy, "/settings/test-connection", controller.TestIoNetConnection)
+		dto.GetP(deploy, "/", controller.GetAllDeployments, dto.PageParams())
+		dto.GetP(deploy, "/search", controller.SearchDeployments, dto.PageParams())
+		dto.PostB(deploy, "/test-connection", controller.TestIoNetConnection)
+		dto.Get(deploy, "/hardware-types", controller.GetHardwareTypes)
+		dto.Get(deploy, "/locations", controller.GetLocations)
+		dto.GetP(deploy, "/available-replicas", controller.GetAvailableReplicas)
+		dto.PostB(deploy, "/price-estimation", controller.GetPriceEstimation)
+		dto.GetP(deploy, "/check-name", controller.CheckClusterNameAvailability)
+		dto.PostB(deploy, "/", controller.CreateDeployment)
+		dto.Get(deploy, "/:id", controller.GetDeployment, option.Path("id", "Deployment ID"))
+		dto.GetP(deploy, "/:id/logs", controller.GetDeploymentLogs, option.Path("id", "Deployment ID"))
+		dto.Get(deploy, "/:id/containers", controller.ListDeploymentContainers, option.Path("id", "Deployment ID"))
+		dto.Get(deploy, "/:id/containers/:container_id", controller.GetContainerDetails, option.Path("id", "Deployment ID"), option.Path("container_id", "Container ID"))
+		dto.PutB(deploy, "/:id", controller.UpdateDeployment, option.Path("id", "Deployment ID"))
+		dto.PutB(deploy, "/:id/name", controller.UpdateDeploymentName, option.Path("id", "Deployment ID"))
+		dto.PostB(deploy, "/:id/extend", controller.ExtendDeployment, option.Path("id", "Deployment ID"))
+		dto.Delete(deploy, "/:id", controller.DeleteDeployment, option.Path("id", "Deployment ID"))
+	}
+}

@@ -1,0 +1,182 @@
+package controller
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/middleware"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
+
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+)
+
+type wechatLoginResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+	Data    string `json:"data"`
+}
+
+func getWeChatIdByCode(code string) (string, error) {
+	if code == "" {
+		return "", errors.New("invalid parameter")
+	}
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s/api/wechat/user?code=%s", common.WeChatServerAddress, url.QueryEscape(code)), nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", common.WeChatServerToken)
+	client := http.Client{
+		Timeout: 5 * time.Second,
+	}
+	httpResponse, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer httpResponse.Body.Close()
+	var res wechatLoginResponse
+	err = common.DecodeJson(httpResponse.Body, &res)
+	if err != nil {
+		return "", err
+	}
+	if !res.Success {
+		return "", errors.New(res.Message)
+	}
+	if res.Data == "" {
+		return "", errors.New("verification code is incorrect or has expired")
+	}
+	return res.Data, nil
+}
+
+func WeChatAuth(c *gin.Context) {
+	if !common.WeChatAuthEnabled {
+		c.JSON(http.StatusOK, gin.H{
+			"message": "the administrator has not enabled login and registration via WeChat",
+			"success": false,
+		})
+		return
+	}
+	code := c.Query("code")
+	wechatId, err := getWeChatIdByCode(code)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	user := model.User{
+		WeChatId: wechatId,
+	}
+	if model.IsWeChatIdAlreadyTaken(wechatId) {
+		err := user.FillUserByWeChatId()
+		if err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		if user.Id == 0 {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "user has been deactivated",
+			})
+			return
+		}
+	} else {
+		if common.RegisterEnabled {
+			user.Username = "wechat_" + strconv.Itoa(model.GetMaxUserId()+1)
+			user.DisplayName = "WeChat User"
+			user.Role = common.RoleCommonUser
+			user.Status = common.UserStatusEnabled
+
+			if err := user.Insert(0); err != nil {
+				common.ApiError(c, err)
+				return
+			}
+		} else {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "the administrator has disabled new user registration",
+			})
+			return
+		}
+	}
+
+	if user.Status != common.UserStatusEnabled {
+		c.JSON(http.StatusOK, gin.H{
+			"message": "user has been banned",
+			"success": false,
+		})
+		return
+	}
+	setupLogin(&user, nil, c)
+}
+
+type wechatBindRequest struct {
+	Code string `json:"code"`
+}
+
+func WeChatBind(c *gin.Context) {
+	identity, ok := middleware.GetStepUpIdentity(c)
+	if !ok {
+		writeSecurityOperationError(c, service.ErrAuthTokenInvalid)
+		return
+	}
+	succeeded := false
+	defer func() {
+		recordUserSecurityAudit(c, identity.UserID, "user.binding_bind", map[string]any{"provider": "wechat", "success": succeeded})
+	}()
+	if !common.WeChatAuthEnabled {
+		c.JSON(http.StatusOK, gin.H{
+			"message": "the administrator has not enabled login and registration via WeChat",
+			"success": false,
+		})
+		return
+	}
+	var req wechatBindRequest
+	if err := common.DecodeJson(c.Request.Body, &req); err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "Invalid request",
+		})
+		return
+	}
+	code := strings.TrimSpace(req.Code)
+	context, err := common.Marshal(service.AccountBindingContext{Provider: "wechat", Code: code})
+	if err != nil {
+		writeSecurityOperationError(c, err)
+		return
+	}
+	if middleware.RequireSecurityProof(c, service.VerificationOperation{Scope: service.VerificationScopeAccountBind, Context: context}) == nil {
+		return
+	}
+	wechatId, err := getWeChatIdByCode(code)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if model.IsWeChatIdAlreadyTaken(wechatId) {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "this WeChat account is already bound",
+		})
+		return
+	}
+	// 只更新绑定列，避免完整用户快照覆盖并发的封禁、降权或分组变更。
+	if err := model.DB.Transaction(func(tx *gorm.DB) error {
+		return model.UpdateUserBindColumnForSessionWithTx(tx, identity, "wechat_id", wechatId)
+	}); err != nil {
+		writeSecurityOperationError(c, err)
+		return
+	}
+	succeeded = true
+	model.LiftShadowBan(identity.UserID, "linked wechat")
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+	})
+	return
+}
