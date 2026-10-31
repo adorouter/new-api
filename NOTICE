@@ -56,3 +56,8 @@ and other third-party components. Electron and Chromium third-party license
 notices must remain available with desktop installers and installed apps.
 
 ==== End of Notices ====
+
+AdoRouter modified this software, most recently on 2026-10-31. It is based on
+new-api by QuantumNous (https://github.com/QuantumNous/new-api), by way of the
+unorouter fork (https://github.com/unorouter/new-api). Both are AGPL-3.0, and so is
+this version.
