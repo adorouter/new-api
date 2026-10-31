@@ -147,7 +147,7 @@ func (p *DiscordProvider) GetUserInfo(ctx context.Context, token *OAuthToken) (*
 
 	logger.LogDebug(ctx, "[OAuth-Discord] GetUserInfo success: uid=%s, username=%s, name=%s, email=%t", discordUser.UID, discordUser.ID, discordUser.Name, discordUser.Email != "")
 
-	if err := checkAdoDiscordAccess(ctx, token.AccessToken, discordUser.Verified, discordUser.Email); err != nil {
+	if err := checkAdoDiscordAccess(discordUser.Verified, discordUser.Email); err != nil {
 		return nil, err
 	}
 
