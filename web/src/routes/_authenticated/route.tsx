@@ -22,6 +22,9 @@ import { AuthenticatedLayout } from '@/components/layout'
 import { resolveAuthentication } from '@/lib/auth-session'
 import { useAuthStore } from '@/stores/auth-store'
 
+const ADO_ADMIN_ROLE = 10
+const ADO_WEBSITE_URL = 'https://adorouter.com'
+
 export const Route = createFileRoute('/_authenticated')({
   beforeLoad: async ({ location }) => {
     // The root guard may have skipped its refresh because no session hint was
@@ -37,6 +40,11 @@ export const Route = createFileRoute('/_authenticated')({
         to: '/sign-in',
         search: { redirect: location.href },
       })
+    }
+
+    // adorouter's console is for admins. Everyone else uses the website.
+    if (auth.user.role < ADO_ADMIN_ROLE) {
+      window.location.replace(ADO_WEBSITE_URL)
     }
   },
   component: AuthenticatedLayout,
