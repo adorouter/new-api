@@ -94,7 +94,7 @@ func Login(c *gin.Context) {
 		case errors.Is(err, model.ErrUserEmptyCredentials):
 			common.ApiError(c, common.NewMessage("Invalid parameters"))
 		case errors.Is(err, model.ErrUserDisabled):
-			common.ApiError(c, common.NewMessage("This account is suspended. Contact support@unorouter.com if you think this is a mistake."))
+			common.ApiError(c, common.NewMessage("This account is suspended. Contact support@adorouter.com if you think this is a mistake."))
 		default:
 			common.ApiErrorT(c, "Username or password is incorrect, or user has been banned")
 		}

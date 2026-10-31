@@ -9,7 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const corsOwnDomain = "unorouter.com"
+const corsOwnDomain = "adorouter.com"
 
 // Bearer works from any origin; only our own sites may send the session cookie.
 func CORS() gin.HandlerFunc {
