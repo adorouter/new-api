@@ -1,5 +1,3 @@
-> **AdoRouter fork.** AdoRouter modified this software, most recently on 2026-10-31. It is based on new-api by QuantumNous (https://github.com/QuantumNous/new-api), by way of the unorouter fork (https://github.com/unorouter/new-api). Both are AGPL-3.0, and so is this version. See [NOTICE](NOTICE).
-
 <div align="center">
 
 ![new-api](/web/public/logo.png)
