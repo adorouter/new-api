@@ -154,6 +154,9 @@ func catalogPricing(m model.Pricing, groupRatio map[string]float64, showOriginal
 			sticker := m.ModelPrice
 			p.origFixed = &sticker
 		}
+	} else if input, output, ok := adoExpressionPrices(m); ok {
+		p.input = input * ratio
+		p.output = output * ratio
 	} else {
 		p.input = m.ModelRatio * quotaToUSD * ratio
 		p.output = p.input * m.CompletionRatio
@@ -211,7 +214,9 @@ func catalogModality(m model.Pricing, md dto.ModelMetadata) (modelType string, c
 			return "text", false
 		}
 	}
-	return "text", len(md.OutputModalities) > 0
+	// adorouter adds models by hand until new-api-sync runs, so they have no
+	// modalities to state. Non-chat endpoints have already returned above.
+	return "text", true
 }
 
 // Every catalog surface must see the SAME models: what a caller may route is a

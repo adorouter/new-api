@@ -33,8 +33,8 @@ func TestCatalogModality(t *testing.T) {
 		// An image generator that also returns text is still an image model:
 		// putting it in the chat picker sends chat traffic to /images.
 		{"image plus text is image", []string{"image", "text"}, "image", false},
-		// No stated modality means nothing can be claimed, so not chat-eligible.
-		{"absent modality is not chat", nil, "text", false},
+		// adorouter's hand-added models state no modality and must still reach the chat.
+		{"absent modality is chat", nil, "text", true},
 	}
 	for _, c := range cases {
 		gotType, gotChat := catalogModality(model.Pricing{}, dto.ModelMetadata{OutputModalities: c.modalites})
@@ -78,6 +78,13 @@ func TestCatalogModalityEndpointOverridesTextClaim(t *testing.T) {
 
 func TestCatalogPricing(t *testing.T) {
 	ratios := map[string]float64{"cheap": 0.5, "full": 1}
+
+	t.Run("expression priced quotes the expression, not the placeholder ratio", func(t *testing.T) {
+		m := model.Pricing{ModelRatio: 37.5, CompletionRatio: 1, BillingMode: "tiered_expr", BillingExpr: `tier("standard", p * 0.3 + c * 1.2)`, EnableGroup: []string{"markup"}}
+		p := catalogPricing(m, map[string]float64{"markup": 1.25}, false)
+		assert.InDelta(t, 0.375, p.input, 1e-9)
+		assert.InDelta(t, 1.5, p.output, 1e-9)
+	})
 
 	t.Run("ratio priced applies the cheapest group", func(t *testing.T) {
 		m := model.Pricing{ModelRatio: 2.5, CompletionRatio: 5, EnableGroup: []string{"cheap", "full"}}
