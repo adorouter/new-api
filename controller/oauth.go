@@ -391,6 +391,12 @@ func HandleOAuth(c *gin.Context) {
 			writeSecurityOperationError(c, err)
 			return
 		}
+		// A refused sign-in goes back to the website that started it, not this host's
+		// console, which adorouter's users shouldn't see.
+		var denied *oauth.AccessDeniedError
+		if errors.As(err, &denied) && setupOAuthErrorRedirect(c, redirectURI, denied.Message) {
+			return
+		}
 		handleOAuthError(c, err)
 		return
 	}
