@@ -461,7 +461,11 @@ func handleOAuthLogin(c *gin.Context, provider oauth.Provider, oauthUser *oauth.
 	user, migration, err := findOrCreateOAuthUser(c, provider, oauthUser, token, payload.AffiliateCode, payload.CustomerType, payload.Terms)
 	if err != nil {
 		var msg string
-		switch err.(type) {
+		switch e := err.(type) {
+		case *oauth.AccessDeniedError:
+			// The per-IP sign-up limit: say why on the website rather than falling
+			// through to a generic error on the API host's console.
+			msg = e.Message
 		case *types.OAuthUserDeletedError:
 			msg = "User has been deleted"
 		case *types.OAuthRegistrationDisabledError:
