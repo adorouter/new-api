@@ -18,5 +18,7 @@ var CreemFeeFixed = 0.5
 var CreemFeePercent = 0.0
 
 // Above this the fixed cut is small enough relative to the top-up to absorb, so
-// no fee is added. 0 applies the fee to every custom amount.
-var CreemFeeThreshold = 2.0
+// no fee is added. 0 applies the fee to every custom amount. adorouter uses 4.99,
+// so every top-up under 5.00 pays the fee: at its 25% margin, a 3.00 top-up
+// without it would earn about 0.06 after Creem's cut.
+var CreemFeeThreshold = 4.99
