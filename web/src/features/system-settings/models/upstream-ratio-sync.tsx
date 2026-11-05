@@ -407,6 +407,7 @@ export function UpstreamRatioSync() {
       <div className='min-h-0 flex-1'>
         {fetchMutation.isError ? (
           <ErrorState
+            title={t('Failed to fetch upstream prices')}
             description={fetchMutation.error.message}
             action={
               <Button

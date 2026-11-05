@@ -101,7 +101,9 @@ export function PricingAmountInput({
             .join(' ') || undefined
         }
         onChange={(event) => {
-          const next = event.target.value
+          // AdoRouter: decimal keypads in comma locales (most of Europe) type ","
+          // for the separator. Rejecting it left "2,3077" stuck at "2".
+          const next = event.target.value.replaceAll(',', '.')
           if (!/^(\d+(\.\d*)?|\.\d*)?$/.test(next)) return
           const nextAmount = next === '.' || next === '' ? 0 : Number(next)
           const nextUSD = nextAmount / currency.exchangeRate

@@ -18,7 +18,14 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import type { ColumnDef, RowSelectionState } from '@tanstack/react-table'
 import { Search } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+} from 'react'
 import { useTranslation } from 'react-i18next'
 
 import {
@@ -60,6 +67,70 @@ type ChannelSelectorDialogProps = {
   channelEndpoints: Record<number, string>
   onChannelEndpointsChange: (endpoints: Record<number, string>) => void
   onConfirm: (selectedIds: number[]) => void
+}
+
+// AdoRouter: the endpoint cell reads its value from context. Reading it from the
+// column definitions rebuilt the columns on every keystroke, which remounted the
+// custom endpoint field and kept only the first character typed.
+const SyncEndpointContext = createContext<{
+  channelEndpoints: Record<number, string>
+  updateEndpoint: (channelId: number, endpoint: string) => void
+}>({ channelEndpoints: {}, updateEndpoint: () => {} })
+
+function SyncEndpointCell(props: { channel: UpstreamChannel }) {
+  const { t } = useTranslation()
+  const context = useContext(SyncEndpointContext)
+  // Choosing "custom" stores an empty endpoint. Reading it back with `||` turned
+  // that into the default, so the select snapped to "pricing" and the custom
+  // field never appeared.
+  const currentEndpoint =
+    context.channelEndpoints[props.channel.id] ?? DEFAULT_ENDPOINT
+  const isPreset = ENDPOINT_OPTIONS.some(
+    (option) => option.value === currentEndpoint
+  )
+  const endpointType = isPreset ? currentEndpoint : 'custom'
+
+  return (
+    <div className='flex min-w-0 items-center gap-2'>
+      <Select
+        items={ENDPOINT_OPTIONS.map((option) => ({
+          value: option.value,
+          label: option.label,
+        }))}
+        value={endpointType}
+        onValueChange={(value) => {
+          if (value === null) return
+          context.updateEndpoint(
+            props.channel.id,
+            value === 'custom' ? '' : value
+          )
+        }}
+      >
+        <SelectTrigger className='h-8 w-32'>
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent alignItemWithTrigger={false}>
+          <SelectGroup>
+            {ENDPOINT_OPTIONS.map((option) => (
+              <SelectItem key={option.value} value={option.value}>
+                {option.label}
+              </SelectItem>
+            ))}
+          </SelectGroup>
+        </SelectContent>
+      </Select>
+      {endpointType === 'custom' && (
+        <Input
+          value={currentEndpoint}
+          onChange={(event) =>
+            context.updateEndpoint(props.channel.id, event.target.value)
+          }
+          placeholder={t('/your/endpoint')}
+          className='h-8 min-w-0 flex-1 font-mono text-xs'
+        />
+      )}
+    </div>
+  )
 }
 
 // Synthesized presets from `controller/ratio_sync.go` always carry stable
@@ -113,10 +184,10 @@ export function ChannelSelectorDialog({
     [channelEndpoints, onChannelEndpointsChange]
   )
 
-  const getEndpointType = (endpoint: string) => {
-    const option = ENDPOINT_OPTIONS.find((opt) => opt.value === endpoint)
-    return option ? endpoint : 'custom'
-  }
+  const endpointContext = useMemo(
+    () => ({ channelEndpoints, updateEndpoint }),
+    [channelEndpoints, updateEndpoint]
+  )
 
   const columns = useMemo<ColumnDef<UpstreamChannel>[]>(
     () => [
@@ -224,57 +295,10 @@ export function ChannelSelectorDialog({
         header: t('Sync Endpoint'),
         size: 460,
         minSize: 360,
-        cell: ({ row }) => {
-          const channel = row.original
-          const currentEndpoint =
-            channelEndpoints[channel.id] || DEFAULT_ENDPOINT
-          const endpointType = getEndpointType(currentEndpoint)
-
-          const handleTypeChange = (value: string) => {
-            if (value === 'custom') {
-              updateEndpoint(channel.id, '')
-            } else {
-              updateEndpoint(channel.id, value)
-            }
-          }
-
-          return (
-            <div className='flex min-w-0 items-center gap-2'>
-              <Select
-                items={ENDPOINT_OPTIONS.map((option) => ({
-                  value: option.value,
-                  label: option.label,
-                }))}
-                value={endpointType}
-                onValueChange={(v) => v !== null && handleTypeChange(v)}
-              >
-                <SelectTrigger className='h-8 w-32'>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent alignItemWithTrigger={false}>
-                  <SelectGroup>
-                    {ENDPOINT_OPTIONS.map((option) => (
-                      <SelectItem key={option.value} value={option.value}>
-                        {option.label}
-                      </SelectItem>
-                    ))}
-                  </SelectGroup>
-                </SelectContent>
-              </Select>
-              {endpointType === 'custom' && (
-                <Input
-                  value={currentEndpoint}
-                  onChange={(e) => updateEndpoint(channel.id, e.target.value)}
-                  placeholder={t('/your/endpoint')}
-                  className='h-8 min-w-0 flex-1 font-mono text-xs'
-                />
-              )}
-            </div>
-          )
-        },
+        cell: ({ row }) => <SyncEndpointCell channel={row.original} />,
       },
     ],
-    [channelEndpoints, t, updateEndpoint]
+    [t]
   )
 
   const filteredChannels = useMemo(() => {
@@ -350,24 +374,26 @@ export function ChannelSelectorDialog({
           </div>
         </div>
 
-        <DataTableView
-          table={table}
-          containerClassName='min-h-0 flex-1 rounded-md'
-          tableContainerClassName='h-full min-h-0'
-          tableHeaderClassName='[background-color:var(--table-header)]'
-          splitHeaderScrollClassName='h-full'
-          bodyContainerClassName='[scrollbar-gutter:stable]'
-          splitHeader
-          getColumnClassName={(columnId, part) => {
-            if (columnId === 'select') return 'w-11 text-center align-middle'
-            if (columnId === 'status') {
+        <SyncEndpointContext.Provider value={endpointContext}>
+          <DataTableView
+            table={table}
+            containerClassName='min-h-0 flex-1 rounded-md'
+            tableContainerClassName='h-full min-h-0'
+            tableHeaderClassName='[background-color:var(--table-header)]'
+            splitHeaderScrollClassName='h-full'
+            bodyContainerClassName='[scrollbar-gutter:stable]'
+            splitHeader
+            getColumnClassName={(columnId, part) => {
+              if (columnId === 'select') return 'w-11 text-center align-middle'
+              if (columnId === 'status') {
+                return part === 'header' ? 'h-11 align-middle' : 'align-middle'
+              }
               return part === 'header' ? 'h-11 align-middle' : 'align-middle'
-            }
-            return part === 'header' ? 'h-11 align-middle' : 'align-middle'
-          }}
-          emptyContent={t('No channels found')}
-          emptyCellClassName='h-24 text-center'
-        />
+            }}
+            emptyContent={t('No channels found')}
+            emptyCellClassName='h-24 text-center'
+          />
+        </SyncEndpointContext.Provider>
 
         <div className='shrink-0'>
           <DataTablePagination table={table} />
