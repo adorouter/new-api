@@ -5,9 +5,42 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// A model with no price would be listed at the 37.5 placeholder ($93.75 per 1M
+// input after the +25% group ratio) while every call to it fails, so the public
+// catalog keeps only models an admin has priced.
+func TestCatalogHidesModelsWithoutAPrice(t *testing.T) {
+	previousRatios := ratio_setting.ModelRatio2JSONString()
+	previousSelfUse := operation_setting.SelfUseModeEnabled
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"priced-by-ratio":0.05}`))
+	operation_setting.SelfUseModeEnabled = false
+	t.Cleanup(func() {
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(previousRatios))
+		operation_setting.SelfUseModeEnabled = previousSelfUse
+	})
+
+	pricing := []model.Pricing{
+		{ModelName: "priced-by-ratio"},
+		{ModelName: "priced-per-call", QuotaType: 1, ModelPrice: 0.02},
+		{ModelName: "priced-by-expression", BillingMode: "tiered_expr", BillingExpr: "p * 1"},
+		{ModelName: "never-priced"},
+	}
+	names := []string{}
+	for _, m := range withConfiguredPrice(pricing) {
+		names = append(names, m.ModelName)
+	}
+	assert.Equal(t, []string{"priced-by-ratio", "priced-per-call", "priced-by-expression"}, names)
+
+	operation_setting.SelfUseModeEnabled = true
+	assert.True(t, hasConfiguredPrice(model.Pricing{ModelName: "never-priced"}),
+		"self-use mode bills the placeholder, so the model is really callable")
+}
 
 // The embedded row also declares `description`, so the outer field must be the
 // one that serializes: the detail carries full text, the list a 200-char blurb.

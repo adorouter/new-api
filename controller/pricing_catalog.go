@@ -242,9 +242,9 @@ func visibleCatalogPricing(c fuego.ContextNoBody, includeOffline bool) ([]model.
 	group := applyUserGroupRatio(c, groupRatio)
 	usableGroup := service.GetUserUsableGroups(group)
 	if !includeOffline {
-		return filterPricingByUsableGroups(model.GetPricing(), usableGroup), groupRatio
+		return withConfiguredPrice(filterPricingByUsableGroups(model.GetPricing(), usableGroup)), groupRatio
 	}
-	all := model.GetPricingWithOffline()
+	all := withConfiguredPrice(model.GetPricingWithOffline())
 	online := make([]model.Pricing, 0, len(all))
 	offline := make([]model.Pricing, 0, len(all))
 	for _, item := range all {
@@ -859,7 +859,7 @@ func GetPricingModelGroups(c fuego.ContextNoBody) (dto.PricingModelGroupsData, e
 // nothing can currently route.
 func GetPricingCatalogModel(c fuego.ContextNoBody) (dto.PricingCatalogDetail, error) {
 	pricing, ok := model.GetPricingByModelName(dto.GinCtx(c).Query("model"))
-	if !ok {
+	if !ok || !hasConfiguredPrice(pricing) {
 		return dto.PricingCatalogDetail{}, fuego.NotFoundError{Title: "model not found"}
 	}
 	// Keyed by the resolved name, so only models that exist can occupy the cache.
