@@ -44,7 +44,8 @@ export const defaultBillingSettings: BillingSettings = {
   'quota_setting.free_abuse_cooccur_window_seconds': 600,
   'quota_setting.free_abuse_cooccur_ban_days': 7,
   'quota_setting.free_abuse_username_domain_min_accounts': 0,
-  'quota_setting.free_abuse_username_domain_allowlist': 'gmail.com,googlemail.com,qq.com,outlook.com,hotmail.com,live.com,163.com,126.com,foxmail.com,yahoo.com,icloud.com,proton.me,protonmail.com,mail.ru,yandex.ru,duck.com,mozmail.com',
+  'quota_setting.free_abuse_username_domain_allowlist':
+    'gmail.com,googlemail.com,qq.com,outlook.com,hotmail.com,live.com,163.com,126.com,foxmail.com,yahoo.com,icloud.com,proton.me,protonmail.com,mail.ru,yandex.ru,duck.com,mozmail.com',
   'quota_setting.charge_on_error': false,
   'quota_setting.trust_quota_usd': 10,
   'quota_setting.pre_consume_multiplier': 1,
@@ -55,6 +56,7 @@ export const defaultBillingSettings: BillingSettings = {
   'general_setting.custom_currency_exchange_rate': 1,
   DisplayInCurrencyEnabled: true,
   DisplayTokenStatEnabled: true,
+  ShowOriginalPriceEnabled: false,
   ModelPrice: '',
   ModelRatio: '',
   CacheRatio: '',
@@ -173,8 +175,7 @@ export const getQuotaDefaults = (settings: BillingSettings) => ({
   TopUpLink: settings.TopUpLink,
   quota_setting: {
     trust_quota_usd: settings['quota_setting.trust_quota_usd'],
-    pre_consume_multiplier:
-      settings['quota_setting.pre_consume_multiplier'],
+    pre_consume_multiplier: settings['quota_setting.pre_consume_multiplier'],
     enable_free_model_pre_consume:
       settings['quota_setting.enable_free_model_pre_consume'],
     enable_free_abuse_auto_block:
@@ -185,8 +186,7 @@ export const getQuotaDefaults = (settings: BillingSettings) => ({
       settings['quota_setting.free_abuse_max_distinct_models'],
     free_abuse_max_distinct_models_per_day:
       settings['quota_setting.free_abuse_max_distinct_models_per_day'],
-    free_abuse_max_per_day:
-      settings['quota_setting.free_abuse_max_per_day'],
+    free_abuse_max_per_day: settings['quota_setting.free_abuse_max_per_day'],
     free_abuse_max_errors_per_hour:
       settings['quota_setting.free_abuse_max_errors_per_hour'],
     free_abuse_max_media_err_models:
@@ -203,8 +203,7 @@ export const getQuotaDefaults = (settings: BillingSettings) => ({
       settings['quota_setting.free_abuse_burst_window_days'],
     free_abuse_unverified_pct:
       settings['quota_setting.free_abuse_unverified_pct'],
-    free_abuse_cooccur_mode:
-      settings['quota_setting.free_abuse_cooccur_mode'],
+    free_abuse_cooccur_mode: settings['quota_setting.free_abuse_cooccur_mode'],
     free_abuse_cooccur_ip_min_accounts:
       settings['quota_setting.free_abuse_cooccur_ip_min_accounts'],
     free_abuse_cooccur_fp_min_accounts:

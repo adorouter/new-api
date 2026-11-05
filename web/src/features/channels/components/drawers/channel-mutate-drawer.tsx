@@ -211,6 +211,7 @@ import { ChannelPluginExtensions } from '../channel-plugin-extensions'
 import { ChannelQuickOptions } from '../channel-quick-options'
 import { ChannelTypeLogo } from '../channel-type-badge'
 import { useChannels } from '../channels-provider'
+import { DataPolicySetting } from '../data-policy-setting'
 import { AdvancedCustomEditorDialog } from '../dialogs/advanced-custom-editor-dialog'
 import { ConfigureModelsDialog } from '../dialogs/configure-models-dialog'
 import {
@@ -4821,6 +4822,16 @@ export function ChannelMutateDrawer({
                   decisionsUpstreamPathFields}
                 {tlsInsecureSkipVerifyFields}
               </fieldset>
+            </div>
+            <div
+              role='group'
+              aria-label={t('Provider data policy')}
+              className={channelConfigurationBlockClassName(
+                configuration.blocks.extraSettings,
+                'space-y-4'
+              )}
+            >
+              <DataPolicySetting disabled={sensitiveLocked || isSubmitting} />
             </div>
             {upstreamModelDetectionFields}
             {notesFields}

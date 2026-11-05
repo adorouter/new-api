@@ -359,6 +359,49 @@ export function ModelMutateDrawer(props: {
                         )}
                       />
 
+                      <div className='grid gap-4 sm:grid-cols-2'>
+                        <FormField
+                          control={form.control}
+                          name='context_window'
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>{t('Context window')}</FormLabel>
+                              <FormControl>
+                                <Input
+                                  inputMode='numeric'
+                                  placeholder='1000000'
+                                  {...field}
+                                />
+                              </FormControl>
+                              <FormDescription>
+                                {t('Tokens. Leave empty if unknown.')}
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                        <FormField
+                          control={form.control}
+                          name='max_output_tokens'
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>{t('Max output tokens')}</FormLabel>
+                              <FormControl>
+                                <Input
+                                  inputMode='numeric'
+                                  placeholder='64000'
+                                  {...field}
+                                />
+                              </FormControl>
+                              <FormDescription>
+                                {t('Tokens. Leave empty if unknown.')}
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                      </div>
+
                       <FormField
                         control={form.control}
                         name='icon'

@@ -46,6 +46,8 @@ export interface Model {
   tags?: string
   vendor_id?: number
   endpoints?: string
+  // JSON object of client hints (contextWindow, maxOutputTokens, ...).
+  metadata?: string
   supported_endpoints?: string[]
   status: number
   sync_official: number

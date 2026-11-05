@@ -277,6 +277,22 @@ export const channelFormSchema = z
     system_prompt: z.string().optional(),
     system_prompt_override: z.boolean().optional(),
     decisions_upstream_path: z.string().optional(),
+    // AdoRouter: setting.data_policy, the provider facts behind the public
+    // provider labels and the consent dialog.
+    data_policy_provider: z
+      .string()
+      .max(120, 'Use at most 120 characters')
+      .optional(),
+    data_policy_seat_country: z
+      .string()
+      .regex(/^([A-Z]{2})?$/, 'Use a two-letter country code, like US')
+      .optional(),
+    data_policy_prompts: z
+      .enum(['unknown', 'none', 'retains', 'trains'])
+      .optional(),
+    data_policy_transfer: z
+      .enum(['unknown', 'adequacy', 'dpf', 'scc', 'none'])
+      .optional(),
     // Type-specific settings (stored in settings JSON)
     is_enterprise_account: z.boolean().optional(), // OpenRouter specific
     vertex_key_type: z.enum(['json', 'api_key']).optional(), // Vertex AI specific
@@ -473,6 +489,10 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   system_prompt: '',
   system_prompt_override: false,
   decisions_upstream_path: '',
+  data_policy_provider: '',
+  data_policy_seat_country: '',
+  data_policy_prompts: 'unknown',
+  data_policy_transfer: 'unknown',
   // Type-specific settings
   is_enterprise_account: false,
   vertex_key_type: 'json',
@@ -521,6 +541,7 @@ export function transformChannelToFormDefaults(
     system_prompt: '',
     system_prompt_override: false,
     decisions_upstream_path: '',
+    ...readDataPolicy(undefined),
   }
 
   if (channel.setting) {
@@ -548,6 +569,7 @@ export function transformChannelToFormDefaults(
           typeof parsed.decisions_upstream_path === 'string'
             ? parsed.decisions_upstream_path
             : '',
+        ...readDataPolicy(parsed.data_policy),
       }
     } catch (error) {
       // eslint-disable-next-line no-console
@@ -664,11 +686,116 @@ export function transformChannelToFormDefaults(
   }
 }
 
+type DataPolicyPrompts = NonNullable<ChannelFormValues['data_policy_prompts']>
+type DataPolicyTransfer = NonNullable<ChannelFormValues['data_policy_transfer']>
+
+const DATA_POLICY_PROMPTS: readonly DataPolicyPrompts[] = [
+  'unknown',
+  'none',
+  'retains',
+  'trains',
+]
+const DATA_POLICY_TRANSFERS: readonly DataPolicyTransfer[] = [
+  'unknown',
+  'adequacy',
+  'dpf',
+  'scc',
+  'none',
+]
+
+/**
+ * AdoRouter: setting.data_policy as form fields. Anything missing or unknown
+ * reads as "unknown", which the gateway treats as a provider that may train.
+ */
+export function readDataPolicy(value: unknown): {
+  data_policy_provider: string
+  data_policy_seat_country: string
+  data_policy_prompts: DataPolicyPrompts
+  data_policy_transfer: DataPolicyTransfer
+} {
+  const policy =
+    value && typeof value === 'object' ? (value as Record<string, unknown>) : {}
+  const prompts = DATA_POLICY_PROMPTS.find((p) => p === policy.prompts)
+  const transfer = DATA_POLICY_TRANSFERS.find((p) => p === policy.transfer)
+  return {
+    data_policy_provider:
+      typeof policy.provider === 'string' ? policy.provider : '',
+    data_policy_seat_country:
+      typeof policy.seat_country === 'string' ? policy.seat_country : '',
+    data_policy_prompts: prompts ?? 'unknown',
+    data_policy_transfer: transfer ?? 'unknown',
+  }
+}
+
+/**
+ * The data_policy object for the form fields, or undefined when nothing is set.
+ * "unknown" is left out rather than stored: the gateway reads an absent value
+ * the same way.
+ */
+export function buildDataPolicy(
+  formData: ChannelFormValues
+): Record<string, string> | undefined {
+  const policy: Record<string, string> = {}
+  const provider = formData.data_policy_provider?.trim()
+  const country = formData.data_policy_seat_country?.trim().toUpperCase()
+  const prompts = formData.data_policy_prompts
+  const transfer = formData.data_policy_transfer
+  if (provider) {
+    policy.provider = provider
+  }
+  if (country) {
+    policy.seat_country = country
+  }
+  if (prompts && prompts !== 'unknown') {
+    policy.prompts = prompts
+  }
+  if (transfer && transfer !== 'unknown') {
+    policy.transfer = transfer
+  }
+  return Object.keys(policy).length ? policy : undefined
+}
+
+// Keys this form writes. Any other key already in the channel's setting (set by
+// the sync tool or the API) is kept on save instead of being dropped.
+const FORM_SETTING_KEYS = [
+  'task_plugin_key',
+  'task_extend_plugin_keys',
+  'force_format',
+  'thinking_to_content',
+  'proxy',
+  'pass_through_body_enabled',
+  'responses_websocket_enabled',
+  'system_prompt',
+  'system_prompt_override',
+  'decisions_upstream_path',
+  'http_protocol',
+  'http2_connection_shards',
+  'tls_insecure_skip_verify',
+  'data_policy',
+]
+
+function unmanagedSettings(raw: string | undefined): Record<string, unknown> {
+  if (!raw?.trim()) return {}
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return {}
+    }
+    const rest: Record<string, unknown> = { ...parsed }
+    for (const key of FORM_SETTING_KEYS) delete rest[key]
+    return rest
+  } catch {
+    return {}
+  }
+}
+
 /**
  * Build the setting JSON string from form extra settings
  */
 export function buildSettingJSON(formData: ChannelFormValues): string {
   const settingObj: Record<string, unknown> = {
+    ...unmanagedSettings(formData.setting),
+    data_policy: buildDataPolicy(formData),
     task_plugin_key:
       formData.type === CHANNEL_TYPE_TASK_PLUGIN
         ? formData.task_plugin_key?.trim() || ''

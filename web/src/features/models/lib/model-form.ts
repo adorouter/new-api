@@ -41,6 +41,17 @@ export const modelFormSchema = z.object({
   sync_official: z.boolean().default(true),
   enable_groups: z.array(z.string()).default([]),
   quota_types: z.array(z.number()).default([]),
+  // AdoRouter: the stored metadata JSON, carried through unchanged apart from
+  // the two sizing fields below, so saving the form never drops other hints.
+  metadata: z.string().default(''),
+  context_window: z
+    .string()
+    .regex(/^\d*$/, 'Enter a whole number of tokens')
+    .default(''),
+  max_output_tokens: z
+    .string()
+    .regex(/^\d*$/, 'Enter a whole number of tokens')
+    .default(''),
 })
 
 export type ModelFormValues = z.infer<typeof modelFormSchema>
@@ -57,6 +68,71 @@ export const MODEL_FORM_DEFAULT_VALUES: ModelFormValues = {
   sync_official: true,
   enable_groups: [],
   quota_types: [],
+  metadata: '',
+  context_window: '',
+  max_output_tokens: '',
+}
+
+type MetadataObject = Record<string, unknown>
+
+function parseMetadataObject(metadata: string): MetadataObject | null {
+  if (!metadata.trim()) return {}
+  try {
+    const parsed: unknown = JSON.parse(metadata)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as MetadataObject
+    }
+  } catch {
+    // Unreadable metadata is left exactly as stored.
+  }
+  return null
+}
+
+function sizingText(value: unknown): string {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0
+    ? String(value)
+    : ''
+}
+
+/**
+ * The context window and output cap stored in a model's metadata JSON, as form text.
+ */
+export function readModelSizing(metadata: string): {
+  context_window: string
+  max_output_tokens: string
+} {
+  const parsed = parseMetadataObject(metadata) ?? {}
+  return {
+    context_window: sizingText(parsed.contextWindow),
+    max_output_tokens: sizingText(parsed.maxOutputTokens),
+  }
+}
+
+/**
+ * Writes the two sizing fields into the metadata JSON and keeps every other key.
+ * An empty field removes its key. Metadata that is not a JSON object is returned
+ * unchanged rather than overwritten.
+ */
+export function writeModelSizing(
+  metadata: string,
+  contextWindow: string,
+  maxOutputTokens: string
+): string {
+  const parsed = parseMetadataObject(metadata)
+  if (parsed === null) return metadata
+  const next: MetadataObject = { ...parsed }
+  for (const [key, value] of [
+    ['contextWindow', contextWindow],
+    ['maxOutputTokens', maxOutputTokens],
+  ] as const) {
+    const tokens = Number(value)
+    if (value !== '' && Number.isInteger(tokens) && tokens > 0) {
+      next[key] = tokens
+    } else {
+      delete next[key]
+    }
+  }
+  return Object.keys(next).length ? JSON.stringify(next) : ''
 }
 
 // ============================================================================
@@ -97,6 +173,8 @@ export function transformModelToFormDefaults(model: Model): ModelFormValues {
     sync_official: model.sync_official === 1,
     enable_groups: model.enable_groups || [],
     quota_types: model.quota_types || [],
+    metadata: model.metadata || '',
+    ...readModelSizing(model.metadata || ''),
   }
 }
 
@@ -119,6 +197,11 @@ export function transformFormDataToModelPayload(
     sync_official: formData.sync_official ? 1 : 0,
     enable_groups: formData.enable_groups,
     quota_types: formData.quota_types,
+    metadata: writeModelSizing(
+      formData.metadata,
+      formData.context_window,
+      formData.max_output_tokens
+    ),
   }
 }
 
