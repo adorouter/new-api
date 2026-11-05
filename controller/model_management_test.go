@@ -974,6 +974,26 @@ export function parseTaskResult() { return {}; }
 				var ability model.Ability
 				require.NoError(t, db.Where("model = ? AND channel_id = ? AND enabled = ?", "matrix-hidden-unpriced", active.Id, true).First(&ability).Error)
 			})
+			t.Run("update_keeps_metadata_the_request_leaves_out", func(t *testing.T) {
+				stored := &model.Model{ModelName: "matrix-sized", Status: 1, Metadata: `{"contextWindow":1000000,"maxOutputTokens":64000}`}
+				require.NoError(t, stored.Insert())
+				t.Cleanup(func() { require.NoError(t, db.Unscoped().Delete(&model.Model{}, stored.Id).Error) })
+
+				// The console's metadata form sends every field except metadata.
+				form := map[string]any{"id": stored.Id, "model_name": stored.ModelName, "description": "Edited", "status": 1}
+				response := modelManagementRequest(t, UpdateModelMeta, http.MethodPut, "/api/models/", form, nil)
+				require.Contains(t, response.Body.String(), `"success":true`)
+				var reloaded model.Model
+				require.NoError(t, db.First(&reloaded, stored.Id).Error)
+				assert.Equal(t, "Edited", reloaded.Description)
+				assert.JSONEq(t, stored.Metadata, reloaded.Metadata, "an update without metadata keeps the stored value")
+
+				form["metadata"] = ""
+				response = modelManagementRequest(t, UpdateModelMeta, http.MethodPut, "/api/models/", form, nil)
+				require.Contains(t, response.Body.String(), `"success":true`)
+				require.NoError(t, db.First(&reloaded, stored.Id).Error)
+				assert.Empty(t, reloaded.Metadata, "an explicit empty metadata still clears it")
+			})
 			t.Run("metadata_preview_selection_versions_and_transaction", func(t *testing.T) {
 				local := &model.Model{ModelName: "matrix-existing", Description: "Local description", Tags: "keep", Status: 1, SyncOfficial: 1}
 				require.NoError(t, local.Insert())

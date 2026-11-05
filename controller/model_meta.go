@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
 )
 
 // GetAllModelsMeta 获取模型列表（分页）
@@ -141,13 +142,20 @@ func UpdateModelMeta(c *gin.Context) {
 	statusOnly := c.Query("status_only") == "true"
 
 	var m model.Model
-	if err := c.ShouldBindJSON(&m); err != nil {
+	// The body is kept so adoKeepStoredMetadata can see which fields were sent.
+	if err := c.ShouldBindBodyWith(&m, binding.JSON); err != nil {
 		common.ApiError(c, err)
 		return
 	}
 	if m.Id == 0 {
 		common.ApiErrorMsg(c, "Missing model ID")
 		return
+	}
+	if !statusOnly {
+		if err := adoKeepStoredMetadata(c, &m); err != nil {
+			common.ApiError(c, err)
+			return
+		}
 	}
 
 	if statusOnly {
