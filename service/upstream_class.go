@@ -84,7 +84,10 @@ var upstreamRules = []upstreamRule{
 	{markers: []string{"熔断冷却"}, class: UpstreamClass{Known: true, Failover: true, DisableNow: true}, userMessage: "The provider put this route into a cooldown. We have taken it out of rotation, so retry and another provider will pick it up."},
 	// Reseller, lane-fatal states: capability blocked, price raised and the pin
 	// suspended, our token refused, model gone from the merchant.
-	{markers: []string{"暂时无法访问该商家的上游能力", "上调了价格", "账号或令牌状态不允许", "未开放或找不到该模型"}, class: UpstreamClass{Known: true, Failover: true, DisableNow: true}, userMessage: "This provider can no longer serve this model. We have removed it from rotation, so retry and another provider will take it."},
+	// AdoRouter: "该商家未上架或未开放本次请求的模型能力", the pinned merchant has
+	// delisted the model or switched it off (seen on every lane of a merchant that
+	// left the marketplace, 2026-11-08).
+	{markers: []string{"暂时无法访问该商家的上游能力", "上调了价格", "账号或令牌状态不允许", "未开放或找不到该模型", "该商家未上架或未开放本次请求的模型能力"}, class: UpstreamClass{Known: true, Failover: true, DisableNow: true}, userMessage: "This provider can no longer serve this model. We have removed it from rotation, so retry and another provider will take it."},
 	// Reseller, pinned merchant busy or cooling (masked as 400 a third of the time)
 	// and merchant rejecting the request's parameters or capability: a sibling
 	// merchant serves the same body, and a lane doing this all day is dead.
@@ -244,6 +247,12 @@ var upstreamRules = []upstreamRule{
 	// of it against lanes that did nothing wrong. The prompt caused it, not the lane.
 	{markers: []string{"检测到该会话包含敏感信息"}, class: UpstreamClass{Known: true, Failover: true, Count: CountNone}, userMessage: "The provider's content filter closed this conversation. Rephrasing the last message usually clears it."},
 	{markers: []string{"does not support chat completions", "or is not supported for generatecontent", "model was not found. make sure you are using the correct endpoint"}, class: UpstreamClass{Known: true, Failover: false, Count: CountNone}, userMessage: "This model cannot be called from the chat completions endpoint."},
+
+	// AdoRouter: last, so every rule above wins first. Any other pinned-merchant
+	// error from the marketplace ("固定商家当前不可用" opens all of them) reached
+	// customers verbatim, in Chinese, with the marketplace's request ids, which
+	// gave away where the lane comes from. A sibling lane can serve the request.
+	{markers: []string{"固定商家当前不可用"}, class: UpstreamClass{Known: true, Failover: true, Count: CountFailure, Cooldown: true}, userMessage: "This provider could not take the request right now. Retry and another provider will pick it up."},
 }
 
 // matchUpstreamRule returns the first rule whose marker appears in the message,
