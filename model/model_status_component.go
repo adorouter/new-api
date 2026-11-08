@@ -1,7 +1,11 @@
 package model
 
 import (
+	"slices"
+	"strings"
+
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/setting/model_setting"
 
 	"gorm.io/gorm/clause"
 )
@@ -61,6 +65,12 @@ func GetAllPublicModelStatusComponents() ([]*ModelStatusComponent, error) {
 		Where("last_up_at >= ? OR created_at >= ?", cutoff, cutoff).
 		Order("sort_order ASC, model_name ASC").
 		Find(&rows).Error
+	// AdoRouter: the public page lists the models the catalog shows. The
+	// "[1m]" long-context aliases and catalog-hidden models were counted as
+	// models of their own (67 on the status page beside 55 in the catalog).
+	rows = slices.DeleteFunc(rows, func(c *ModelStatusComponent) bool {
+		return strings.HasSuffix(c.ModelName, "[1m]") || model_setting.IsCatalogHiddenModel(c.ModelName)
+	})
 	return rows, err
 }
 
