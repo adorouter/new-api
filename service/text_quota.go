@@ -484,6 +484,12 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 		}
 	}
 
+	// AdoRouter: a priced marketplace request never settles below the per-request
+	// minimum. A request priced at 0 (a free model) stays free.
+	if summary.hasBillableUsage() && summary.Quota > 0 {
+		summary.Quota = max(summary.Quota, adoMinRequestQuota(relayInfo.UsingGroup))
+	}
+
 	for _, item := range summary.ToolSurchargeItems {
 		q := decimal.NewFromFloat(item.Price).
 			Mul(decimal.NewFromInt(int64(item.Count))).
